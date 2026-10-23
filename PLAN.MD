@@ -1,29 +1,28 @@
 # Updated Execution Plan: Reversible Face Privacy for Video
 
-**Stack:** FastAPI + React, SQLite, YOLO26 on a CUDA laptop. **Timeline:** 6 weeks, team of 3-4.
+**Stack:** FastAPI + React, SQLite, YOLO26n fine-tuned on WIDER FACE on a CUDA laptop. **Timeline:** 6 weeks, team of 3-4.
 
 ## What changed
 
 - **Audit log removed entirely.** The Isolation Forest anomaly detection and the admin alerts were built on top of that log, so they go too. The AI domain still has real weight, because you now train and evaluate your own YOLO26 face detector. The security domain is covered by authentication, access control, encryption-enforced ownership, and tamper detection.
 - **Access model is owner-only.** Any logged-in user can upload, and anyone logged in can watch any blurred video. Only the uploader can restore the faces of their own video. The admin role and the revoke feature are gone.
-- **Face detector is YOLO26, fine-tuned for faces.**
+- **Face detector is YOLO26n, fine-tuned on WIDER FACE.**
 - **SQLite stays.**
 
-## 1. Face detection model: YOLO26
+## 1. Face detection model: YOLO26n
 
-YOLO26 ships in n, s, m, l and x detection sizes, installs via `pip install ultralytics`, downloads weights automatically, and exports to formats such as TensorRT and ONNX. One catch: the official `yolo26n/s` weights are general-purpose detectors, not face detectors. You need face-trained weights. I found community checkpoints, but only for other sizes: a nano model fine-tuned on WIDER FACE and a large model on WIDER FACE, which also notes that nano is preferable when speed matters and that performance may drop on footage unlike WIDER FACE photos. I didn't find a ready-made small (s) face checkpoint.
+**Decision: use YOLO26n fine-tuned on WIDER FACE.** YOLO26s training and the n-vs-s comparison are not part of the project scope.
 
-**Recommendation: fine-tune YOLO26s yourself, and keep YOLO26n as the comparison and fallback.**
+The official `yolo26n.pt` weights are general-purpose detectors, not face detectors. The project must use a WIDER FACE fine-tuned YOLO26n checkpoint for face inference.
 
-- **Week 1 fallback:** use the community YOLO26n face weights so the pipeline isn't blocked while you train.
-- **Training:** convert WIDER FACE to YOLO format (one class, about 12.9k train and 3.2k val images) and train in the background:
+- **Training:** when implementation is authorized, convert WIDER FACE to YOLO format (one class, about 12.9k train and 3.2k val images) and fine-tune YOLO26n:
 
 ```bash
-pip install -U ultralytics
-yolo detect train model=yolo26s.pt data=widerface.yaml imgsz=640 epochs=50 batch=16 device=0
+pip install -r requirements.txt
+yolo detect train model=yolo26n.pt data=widerface.yaml imgsz=640 epochs=50 batch=4 device=0
 ```
 
-  Lower `batch` if you run out of VRAM. Budget a few hours, and start it in Week 1.
+  Adjust `batch` to the available VRAM. Repository setup does not include downloading weights or datasets, running inference, or starting training.
 - **Inference:** use a low confidence threshold and a bigger image size for small faces, since a missed face is a privacy leak:
 
 ```python
@@ -32,7 +31,7 @@ boxes = res.boxes.xyxy.cpu().numpy().astype(int)
 ```
 
 - **Optional speedup:** export to TensorRT (`model.export(format="engine", half=True)`) if the demo needs more fps.
-- **Report comparison:** YOLO26n vs YOLO26s on WIDER val (mAP50) and on about 100 frames you label from your own test videos (recall, precision, fps on your GPU). Pick the winner as the default.
+- **Report evaluation:** evaluate the fine-tuned YOLO26n on WIDER FACE val (mAP50) and on about 100 frames you label from your own test videos (recall, precision, fps on your GPU).
 - **Setup check:** install the CUDA build of PyTorch and confirm `torch.cuda.is_available()` before anything else.
 - **Licensing note for the report:** Ultralytics YOLO26 is AGPL-3.0, and WIDER FACE is listed as non-commercial research data. Both are fine for an academic project, but mention them.
 
@@ -122,8 +121,8 @@ I've replaced the week-by-week plan and the team split with a phase-wise plan. T
 - Scaffold the FastAPI backend (stub endpoints) and the Vite React app, and generate the typed client from the OpenAPI schema.
 - Set up the CUDA build of PyTorch and Ultralytics, and confirm `torch.cuda.is_available()`.
 - Choose 2-3 test videos: a single face, a crowd, and fast motion or side profiles.
-- Get a baseline detector running with the community YOLO26n face weights.
-- Convert WIDER FACE to YOLO format and **start the YOLO26s training run in the background**.
+- When implementation is authorized, obtain or train WIDER FACE fine-tuned YOLO26n weights.
+- Convert WIDER FACE to YOLO format and start the YOLO26n fine-tuning run.
 
 **Deliverables:** design document, architecture diagram, API table, repo with both apps running.
 **Exit criteria:** GPU confirmed, stub API reachable from React, training running.
@@ -135,10 +134,10 @@ I've replaced the week-by-week plan and the team split with a phase-wise plan. T
 - Apply heavy blur or pixelation.
 - Gap-fill short detection misses from the previous frame so faces never flash through.
 - Write `public.mp4` at the original fps and resolution, and assert the frame counts match.
-- Label about 100 frames from your own videos, and compare YOLO26n vs YOLO26s on those frames and on WIDER val. Pick the default model.
+- Label about 100 frames from your own videos, and evaluate the fine-tuned YOLO26n on those frames and on WIDER FACE val.
 
-**Deliverables:** `detect.py`, `blur.py`, blurred demo videos, the n vs s comparison table.
-**Exit criteria:** face coverage measured (target ≥ 95%), model chosen, frame counts identical.
+**Deliverables:** `detect.py`, `blur.py`, blurred demo videos, YOLO26n evaluation results.
+**Exit criteria:** face coverage measured (target ≥ 95%), YOLO26n evaluated, frame counts identical.
 
 ### Phase 3: Cryptographic core
 **Goal:** Face crops are protected, restorable only by the owner, and tamper-evident.
@@ -229,7 +228,7 @@ I've replaced the week-by-week plan and the team split with a phase-wise plan. T
 
 | Metric | How to measure | Target |
 |---|---|---|
-| Detector accuracy (n vs s) | mAP50 on WIDER val | Report both |
+| Detector accuracy (YOLO26n) | mAP50 on WIDER FACE val | Report measured mAP50 |
 | Face coverage | % of faces fully covered by blur in your labeled frames | ≥ 95% |
 | Detection speed | fps on your CUDA laptop (PyTorch fp16, and TensorRT if tried) | Report it |
 | Restoration fidelity | Decrypted crop vs. original pixels | Identical (lossless) |
@@ -240,7 +239,7 @@ I've replaced the week-by-week plan and the team split with a phase-wise plan. T
 ## 11. Demo script (7-8 minutes)
 
 1. **Problem (30s):** footage needs privacy, but the owner needs the originals.
-2. **Architecture (1 min):** diagram, the three domains, and the n vs s comparison slide.
+2. **Architecture (1 min):** diagram, the three domains, and the YOLO26n evaluation slide.
 3. **Alice uploads (1 min):** progress bar, with GPU speed shown.
 4. **Bob logs in (1 min):** he sees Alice's video blurred, with no restore option.
 5. **Alice restores (1.5 min):** verify badge, password prompt, watermarked restored stream.
@@ -252,7 +251,7 @@ I've replaced the week-by-week plan and the team split with a phase-wise plan. T
 
 | Risk | Mitigation |
 |---|---|
-| Training takes too long or underperforms | Start in Week 1, and keep the community YOLO26n weights as a fallback |
+| Training takes too long or underperforms | Start YOLO26n fine-tuning early; evaluate a community WIDER FACE fine-tuned YOLO26n checkpoint if needed |
 | Misses on small or profile faces | Larger `imgsz`, low `conf`, padded boxes, gap-fill, and honest recall reporting |
 | GPU out of memory | Smaller batch for training, and fp16 inference |
 | CUDA or driver mismatch | Verify the PyTorch CUDA build in Week 1 |
@@ -272,7 +271,7 @@ I've replaced the week-by-week plan and the team split with a phase-wise plan. T
 
 - Source code, a README, and one-command run instructions
 - Architecture diagram, API table, and threat model
-- Training logs and the n vs s comparison
+- Training logs and the YOLO26n evaluation
 - Attack screenshots and a metrics table
 - Report (problem, design, implementation, results, limitations)
 - Slides and a backup demo video
