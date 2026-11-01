@@ -14,8 +14,8 @@ authentication, encryption, and restoration are not.
 - **Case storage:** `storage/cases/`.
 - **Development integration:** multipart upload, SQLite job status, processed
   video streaming, and React upload/library/player screens.
-- **Planned detector:** a YOLO26n checkpoint fine-tuned on WIDER FACE. The
-  general-purpose YOLO26n weights are not a face detector.
+- **Detector:** a local YOLO26n checkpoint fine-tuned on WIDER FACE, configured
+  as `models/best.pt`. General-purpose YOLO26n weights are not a face detector.
 - **Video pipeline:** sequential OpenCV frame processing with padded Gaussian
   blur and verified output publication.
 
@@ -29,6 +29,9 @@ only for local development and must not be exposed to untrusted networks.
 - Python 3.10 or later (use a version compatible with the installed PyTorch
   build).
 - Node.js 22.12 or later and npm.
+- System FFmpeg on `PATH`, built with the `libx264` and AAC encoders.
+  Media tests also require `ffprobe`. These binaries are not installed by pip;
+  check availability with `ffmpeg -version` and `ffprobe -version`.
 - For model inference, a compatible PyTorch environment and a face-specific
   YOLO26n checkpoint. No model or dataset is downloaded automatically.
 
@@ -45,16 +48,18 @@ The backend reads these settings when it starts:
 | `FRONTEND_ORIGIN` | `http://localhost:5173` | Planned frontend origin |
 | `SESSION_COOKIE_NAME` | `faceprivacy_session` | Planned session-cookie name |
 | `SESSION_COOKIE_SECURE` | `false` | Local-development cookie setting |
-| `FACE_MODEL_PATH` | `models/yolo26n_face.pt` | Local face-specific checkpoint |
+| `FACE_MODEL_PATH` | `models/best.pt` | Local WIDER FACE fine-tuned YOLO26n checkpoint |
 | `FACE_CONFIDENCE_THRESHOLD` | `0.25` | YOLO detection confidence |
 | `FACE_IMAGE_SIZE` | `960` | YOLO inference image size |
 | `FACE_DEVICE` | `auto` | `auto`, `cpu`, `cuda`, or a CUDA device index |
-| `FACE_BLUR_STRENGTH` | `51` | Odd Gaussian kernel size from 3 to 99 |
+| `FACE_BLUR_STRENGTH` | `99` | Odd Gaussian kernel size from 3 to 99 |
 | `FACE_BOX_PADDING` | `0.18` | Bounding-box expansion ratio |
-| `MAX_VIDEO_UPLOAD_BYTES` | `104857600` | Maximum upload size (100 MiB) |
+| `MAX_VIDEO_UPLOAD_BYTES` | `524288000` | Maximum upload size (500 MiB; UI labels this 500 MB) |
 
 Relative paths are resolved from the repository root. `.env` is local-only and
 ignored by Git. No production secrets are configured or required.
+Existing `.env` overrides remain in effect: update the upload limit and blur
+strength there if they still select the previous 100 MiB / 51-kernel defaults.
 
 ## Backend setup
 
@@ -133,16 +138,30 @@ python -m pytest backend\tests
 ## Phase 2: face detection and video blurring
 
 The pipeline reads video frames sequentially, calls a reusable detector,
-validates and pads returned face boxes, blurs those regions, and writes a
-temporary output. It reopens and checks the finished video (dimensions, frame
-rate, and frame count) before publishing it. The original face crops are not
-saved. OpenCV output does **not** preserve the input audio track.
+validates and pads returned face boxes, applies a 99-kernel Gaussian blur by
+default, and writes a temporary MJPG video. FFmpeg combines only that blurred
+video with the source's optional audio tracks. MP4/M4V/MOV outputs use H.264
+with limited-range `yuv420p`, AAC audio, and faststart metadata for browser
+playback and seeking. CLI AVI outputs retain MJPG video and use PCM audio.
+Silent sources remain silent; shorter audio does not truncate video.
 
-Configure `FACE_MODEL_PATH` to an existing **face-specific YOLO26n checkpoint
-fine-tuned for face detection**. The default path is a proposed location only;
-the repository does not include that checkpoint. Missing or non-face model
-checkpoints fail clearly. The code never downloads model weights or datasets,
-trains a model, or substitutes general-purpose object-detection weights.
+The final encoded video is reopened and checked for dimensions, frame rate,
+and exact processed frame count before atomic publication. Encoding failures
+never publish partial output. Original face crops are not saved. Audio content
+is preserved, not anonymized; voices can still identify people.
+
+The backend upload workflow and standalone CLI both default to
+`models/best.pt`, the locally supplied checkpoint with a single `face` class.
+Training code and recorded results are in `yolo-26n-widerface.ipynb`.
+The supplied `models/yolo26n.pt` reports 80 general-purpose object classes,
+not a face class; it is not used for face inference. Both files remain
+unchanged and ignored by Git.
+
+Override `FACE_MODEL_PATH` in `.env` or pass `--model` to the CLI to use another
+local face-specific YOLO26n checkpoint. If an existing `.env` still selects
+`models/yolo26n_face.pt` or `models/yolo26n.pt`, update it to `models/best.pt`.
+Missing or non-face checkpoints fail clearly. The code never downloads model
+weights or datasets, trains a model, or substitutes object-detection weights.
 `FACE_DEVICE=auto` uses CUDA only when PyTorch reports it available; explicit
 CUDA requests fail if CUDA is unavailable. CPU is supported for inference, but
 may be slow.
@@ -159,24 +178,36 @@ paths. The service function `process_case_video` instead writes to a fixed
 `public.mp4` inside the configured storage directory and rejects invalid case
 IDs; the development upload endpoint invokes it in a background task.
 
-The JSON metrics report input dimensions, input frame rate and frame count
-when available, processed frames, valid detected face instances, frames with
-detections, elapsed time, processing FPS, output frame count, output validation
-status, and whether CUDA acceleration was selected. If source metadata omits a
-valid frame rate, output uses 25 FPS and reports the input rate as `null`.
+The JSON metrics report input dimensions, input frame rate and the
+container-reported frame-count estimate when available, processed frames, valid
+detected face instances, frames with detections, elapsed time, processing FPS,
+output frame count, output validation status, and whether CUDA was selected.
+The input estimate is used for progress reporting only: it can overcount or
+undercount and is not a completeness requirement. Publication requires the
+decoded output count to exactly match the frames actually decoded and processed
+from the input; missing output frames still fail validation. No frames are
+added or dropped to match metadata. OpenCV read failure ends input decoding,
+so this check does not independently certify that the source is corruption-free.
+If source metadata omits a valid frame rate, output uses 25 FPS and reports the
+input rate as `null`.
 These statistics describe observed processing, not a privacy guarantee. A
 zero-detection result does not prove the video contains no faces or is safe.
 Frame-by-frame inference can miss faces; temporal gap filling and tracking are
 not implemented.
 
 Automated tests use generated MJPG videos and injected fake detectors; they do
-not validate real model accuracy or GPU inference. The current workspace has no
-`models/yolo26n_face.pt` checkpoint. At the last environment check, Python was
-3.13.2, PyTorch 2.7.0, Torchvision 0.22.0, Ultralytics 8.3.143, and
-`torch.cuda.is_available()` was false; the installed ML packages are below the
-minimum versions in `requirements.txt`. No ML dependencies or drivers were
-changed. Real YOLO inference remains unverified until a compatible environment
-and face-specific checkpoint are supplied.
+not measure real model accuracy. A separate real-model smoke run used the
+bundled Ultralytics sample image to generate a three-frame video. Both the CLI
+and upload API detected six face instances on CUDA, preserved all three frames,
+and passed output validation. The upload reached 100%, full streaming returned
+200, byte-range streaming returned 206, and decoded face regions showed reduced
+edge detail after blur. Temporary smoke inputs and outputs were removed.
+
+The smoke runtime used PyTorch 2.13.0+cu130 and Ultralytics 8.4.184 with CUDA
+available. Activate a Python environment containing the declared dependencies
+before starting the backend or CLI; the default shell's Python may not have
+them. This small integration check does not establish face coverage, accuracy,
+or representative throughput, and did not rerun WIDER FACE evaluation.
 
 Original face encryption, key management, manifest signing, and restoration
 are Phase 3 work and are not implemented here.
@@ -206,12 +237,17 @@ cases open a player and download link. The browser sends `/api/videos/...`
 through Vite's proxy; FastAPI routes themselves are `/videos/...` because the
 proxy removes `/api`.
 
-With the current environment, no face-specific checkpoint is present, so an
-upload is accepted and then reports a **failed** status with a
-`FACE_MODEL_PATH` configuration message. No placeholder video is served as a
-successful result. To process videos, provide a compatible local YOLO26n
-checkpoint fine-tuned for face detection and a compatible ML environment; the
-application does not download models or change dependencies automatically.
+With `models/best.pt` present and a compatible Python environment active, uploads
+use the trained face detector through the same pipeline as the CLI. Missing or
+invalid checkpoints result in a failed job; no placeholder video is served as
+a successful result. The application does not download models or change
+dependencies automatically.
+
+Previously generated videos are not rewritten automatically. Re-upload the
+original after restarting the backend to get stronger blur, retained audio,
+and browser-compatible encoding. Older `mp4v` files can download successfully
+while failing in the browser player; the `.mp4` extension alone does not
+guarantee a supported video codec.
 
 Uploads, list/status endpoints, and public videos currently have no
 authentication or ownership checks. They store source videos locally and are
@@ -229,14 +265,14 @@ schema; it is not an account or authentication mechanism.
 | Authentication, sessions, authorization, rate limiting, CSRF | Deferred; endpoints return 501 |
 | SQLite schema and repeatable initialization | Implemented; no destructive migration |
 | Standalone frame-by-frame face blur pipeline and tests | Implemented with injected test detectors |
-| Real YOLO26n face inference | Scaffolded; requires a face-specific checkpoint and compatible ML environment |
+| Real YOLO26n face inference | Integrated with local `models/best.pt`; CUDA CLI and upload smoke verified |
 | Development upload, job status, case listing, and blurred-video streaming | Implemented; unauthenticated and local-only |
 | Authentication, case ownership, secure deployment | Deferred |
 | Cryptography, manifests, integrity verification, restoration | Deferred |
 | React upload, case library, and playback screens | Implemented for development uploads |
 | Login and registration screens | Scaffolded; actions are disabled pending authentication |
 | Typed health client and Vite development proxy | Implemented |
-| YOLO26n training and dataset downloads | Deferred |
+| YOLO26n training and dataset downloads | Training notebook supplied; runtime does not train or download |
 
 Do not treat remaining API placeholders, the development UI, or face-blur
 output as a security guarantee. Further implementation should follow

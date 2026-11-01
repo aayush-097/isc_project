@@ -51,7 +51,7 @@ def blur_face_regions(
     boxes: Sequence[Sequence[float]],
     *,
     padding: float = 0.18,
-    strength: int = 51,
+    strength: int = 99,
 ) -> tuple[NDArray[np.uint8], int]:
     """Return a blurred copy and the number of valid regions processed."""
     validate_frame(frame)
@@ -73,7 +73,7 @@ def blur_faces(
     boxes: Sequence[Sequence[float]],
     *,
     padding: float = 0.18,
-    strength: int = 51,
+    strength: int = 99,
 ) -> NDArray[np.uint8]:
     """Blur detected face regions on a copy, leaving the input frame unchanged."""
     output, _ = blur_face_regions(frame, boxes, padding=padding, strength=strength)

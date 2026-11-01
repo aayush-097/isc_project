@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import subprocess
 import tempfile
 import time
 from collections.abc import Callable
@@ -48,16 +49,6 @@ def _metadata_number(value: float) -> float | None:
     return value if math.isfinite(value) and value > 0 else None
 
 
-def _writer_fourcc(path: Path) -> int:
-    suffix = path.suffix.lower()
-    if suffix not in SUPPORTED_OUTPUT_SUFFIXES:
-        raise VideoProcessingError(
-            f"Unsupported output video extension '{path.suffix}'. "
-            f"Use one of: {', '.join(sorted(SUPPORTED_OUTPUT_SUFFIXES))}."
-        )
-    return cv2.VideoWriter_fourcc(*("MJPG" if suffix == ".avi" else "mp4v"))
-
-
 def _verify_output(
     path: Path,
     *,
@@ -98,6 +89,59 @@ def _verify_output(
         capture.release()
 
 
+def _encode_output(intermediate: Path, source: Path, destination: Path) -> None:
+    command = [
+        "ffmpeg",
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-i",
+        str(intermediate),
+        "-i",
+        str(source),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a?",
+        "-fps_mode",
+        "passthrough",
+    ]
+    if destination.suffix.lower() == ".avi":
+        # The intermediate AVI already contains MJPG; preserve it and encode audio as PCM.
+        command.extend(["-c:v", "copy", "-c:a", "pcm_s16le"])
+    else:
+        command.extend(
+            [
+                "-c:v", "libx264",
+                # MJPG is full-range; convert levels as well as marking limited-range H.264.
+                "-vf", "scale=in_range=pc:out_range=tv",
+                "-color_range", "tv",
+                "-pix_fmt", "yuv420p",
+                "-c:a", "aac",
+                "-movflags", "+faststart",
+                "-f", "mov" if destination.suffix.lower() == ".mov" else "mp4",
+            ]
+        )
+    command.append(str(destination))
+    try:
+        subprocess.run(
+            command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        )
+    except FileNotFoundError as exc:
+        raise VideoProcessingError(
+            "FFmpeg is required to encode processed video; install the ffmpeg system binary."
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        raise VideoProcessingError(
+            f"FFmpeg output encoding failed: {detail or f'exit status {exc.returncode}'}"
+        ) from exc
+    except OSError as exc:
+        raise VideoProcessingError(f"Could not start FFmpeg: {exc}") from exc
+
+
 def process_video(
     input_path: Path,
     output_path: Path,
@@ -122,7 +166,10 @@ def process_video(
             f"Could not create output directory {destination.parent}: {exc}"
         ) from exc
     if destination.suffix.lower() not in SUPPORTED_OUTPUT_SUFFIXES:
-        _writer_fourcc(destination)
+        raise VideoProcessingError(
+            f"Unsupported output video extension '{destination.suffix}'. "
+            f"Use one of: {', '.join(sorted(SUPPORTED_OUTPUT_SUFFIXES))}."
+        )
 
     if detector is None:
         from backend.app.ai.face_detector import YoloFaceDetector
@@ -140,6 +187,7 @@ def process_video(
     capture = cv2.VideoCapture(str(source))
     writer: cv2.VideoWriter | None = None
     temporary_path: Path | None = None
+    encoded_path: Path | None = None
     started_at = time.perf_counter()
     try:
         if not capture.isOpened():
@@ -153,25 +201,24 @@ def process_video(
         height, width = frame.shape[:2]
         metadata_fps = _metadata_number(capture.get(cv2.CAP_PROP_FPS))
         output_fps = metadata_fps or DEFAULT_OUTPUT_FPS
+        # Container frame counts may be estimates; decoded frames determine output completeness.
         metadata_count = _metadata_number(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         input_frame_count = int(round(metadata_count)) if metadata_count else None
 
         file_descriptor, temporary_name = tempfile.mkstemp(
-            prefix=f".{destination.stem}.", suffix=destination.suffix, dir=destination.parent
+            prefix=f".{destination.stem}.", suffix=".avi", dir=destination.parent
         )
         os.close(file_descriptor)
         temporary_path = Path(temporary_name)
         temporary_path.unlink()
         writer = cv2.VideoWriter(
             str(temporary_path),
-            _writer_fourcc(destination),
+            cv2.VideoWriter_fourcc(*"MJPG"),
             output_fps,
             (width, height),
         )
         if not writer.isOpened():
-            raise VideoProcessingError(
-                f"Could not initialize an output writer for {destination.suffix}."
-            )
+            raise VideoProcessingError("Could not initialize the intermediate MJPG video writer.")
 
         processed_frames = 0
         detected_faces = 0
@@ -208,26 +255,27 @@ def process_video(
 
         if processed_frames == 0:
             raise VideoProcessingError("No input frames were processed.")
-        if input_frame_count is not None and processed_frames != input_frame_count:
-            raise VideoProcessingError(
-                f"Input frame count did not match metadata (expected "
-                f"{input_frame_count}, processed {processed_frames})."
-            )
         writer.release()
         writer = None
         capture.release()
 
         if temporary_path is None or not temporary_path.is_file() or temporary_path.stat().st_size == 0:
             raise VideoProcessingError("Video writer did not produce an output file.")
+        file_descriptor, encoded_name = tempfile.mkstemp(
+            prefix=f".{destination.stem}.", suffix=destination.suffix, dir=destination.parent
+        )
+        os.close(file_descriptor)
+        encoded_path = Path(encoded_name)
+        _encode_output(temporary_path, source, encoded_path)
         output_frame_count = _verify_output(
-            temporary_path,
+            encoded_path,
             width=width,
             height=height,
             expected_frames=processed_frames,
             expected_fps=output_fps,
         )
-        os.replace(temporary_path, destination)
-        temporary_path = None
+        os.replace(encoded_path, destination)
+        encoded_path = None
 
         elapsed = time.perf_counter() - started_at
         processing_fps = processed_frames / elapsed if elapsed > 0 else 0.0
@@ -256,3 +304,5 @@ def process_video(
         capture.release()
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)
+        if encoded_path is not None:
+            encoded_path.unlink(missing_ok=True)

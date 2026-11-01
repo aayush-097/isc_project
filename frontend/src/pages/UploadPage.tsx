@@ -7,7 +7,7 @@ import {
 } from "../lib/api";
 import { formatFileSize, ProcessingMetrics, StatusBadge } from "../components/VideoComponents";
 
-const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+const MAX_UPLOAD_BYTES = 500 * 1024 * 1024;
 const ACCEPTED_EXTENSIONS = new Set([".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm"]);
 
 function extensionOf(name: string): string {
@@ -96,7 +96,7 @@ export default function UploadPage() {
       return;
     }
     if (file.size > MAX_UPLOAD_BYTES) {
-      setValidationError("The maximum video upload size is 100 MB.");
+      setValidationError("The maximum video upload size is 500 MB.");
       return;
     }
 
@@ -178,7 +178,7 @@ export default function UploadPage() {
           <progress aria-label="Upload progress" className="progress-bar" max={100} value={uploadProgress ?? 0} />
         )}
         <p className="form-note">
-          Maximum 100 MB. Accepted formats depend on installed OpenCV codecs.
+          Maximum 500 MB. Accepted formats depend on installed OpenCV codecs.
           Upload and case endpoints are unauthenticated and for local development only.
         </p>
       </form>

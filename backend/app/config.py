@@ -20,13 +20,13 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:5173"
     session_cookie_name: str = "faceprivacy_session"
     session_cookie_secure: bool = False
-    face_model_path: Path = PROJECT_ROOT / "models" / "yolo26n_face.pt"
+    face_model_path: Path = PROJECT_ROOT / "models" / "best.pt"
     face_confidence_threshold: float = Field(default=0.25, ge=0, le=1)
     face_image_size: int = Field(default=960, ge=32, le=4096)
     face_device: str = "auto"
-    face_blur_strength: int = Field(default=51, ge=3, le=99)
+    face_blur_strength: int = Field(default=99, ge=3, le=99)
     face_box_padding: float = Field(default=0.18, ge=0, le=1)
-    max_video_upload_bytes: int = Field(default=100 * 1024 * 1024, ge=1)
+    max_video_upload_bytes: int = Field(default=500 * 1024 * 1024, ge=1)
 
     @field_validator("database_path", "storage_path")
     @classmethod

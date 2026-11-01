@@ -86,7 +86,9 @@ class VideoProcessingMetrics(BaseModel):
     input_width: int
     input_height: int
     input_fps: float | None
-    input_frame_count: int | None
+    input_frame_count: int | None = Field(
+        description="Container-reported frame-count estimate, not the decoded frame count."
+    )
     processed_frames: int
     detected_face_instances: int
     frames_with_detections: int

@@ -92,3 +92,4 @@ coverage/
 .DS_Store
 Thumbs.db
 *~
+!models/yolo26n.pt

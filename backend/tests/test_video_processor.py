@@ -1,3 +1,7 @@
+import json
+import subprocess
+from pathlib import Path
+
 import cv2
 import numpy as np
 import pytest
@@ -75,6 +79,151 @@ def read_all(path):
         return frames
     finally:
         capture.release()
+
+
+def probe_streams(path):
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_streams", "-of", "json", str(path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)["streams"]
+
+
+def create_video_with_audio(tmp_path, audio_duration):
+    silent = tmp_path / "silent.avi"
+    source = tmp_path / "with-audio.mkv"
+    create_video(silent, make_frames() * 4)
+    subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(silent),
+            "-f", "lavfi", "-i",
+            f"sine=frequency=440:sample_rate=48000:duration={audio_duration}",
+            "-map", "0:v:0", "-map", "1:a:0",
+            "-c:v", "copy", "-c:a", "pcm_s16le", str(source),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return source
+
+
+def assert_faststart(path):
+    data = path.read_bytes()
+    atom_types = []
+    offset = 0
+    while offset + 8 <= len(data):
+        size = int.from_bytes(data[offset:offset + 4], "big")
+        atom_types.append(data[offset + 4:offset + 8])
+        if size == 0:
+            break
+        assert size >= 8
+        offset += size
+    assert atom_types.index(b"moov") < atom_types.index(b"mdat")
+
+
+@pytest.mark.parametrize("suffix", [".mp4", ".m4v", ".mov", ".avi"])
+@pytest.mark.parametrize("audio_duration", [0.4, 1.8])
+def test_preserves_audio_and_all_blurred_video_frames(tmp_path, suffix, audio_duration):
+    source = create_video_with_audio(tmp_path, audio_duration)
+    destination = tmp_path / f"public{suffix}"
+    stats = process_video(
+        source,
+        destination,
+        FakeDetector({2: [(31, 15, 65, 49)]}),
+        settings=make_test_settings(tmp_path),
+    )
+
+    streams = probe_streams(destination)
+    video_streams = [stream for stream in streams if stream["codec_type"] == "video"]
+    audio_streams = [stream for stream in streams if stream["codec_type"] == "audio"]
+    assert len(video_streams) == len(audio_streams) == 1
+    if suffix == ".avi":
+        assert video_streams[0]["codec_name"] == "mjpeg"
+        assert audio_streams[0]["codec_name"] == "pcm_s16le"
+    else:
+        assert video_streams[0]["codec_name"] == "h264"
+        assert video_streams[0]["pix_fmt"] == "yuv420p"
+        assert audio_streams[0]["codec_name"] == "aac"
+        assert_faststart(destination)
+    frames = read_all(destination)
+    assert len(frames) == stats.processed_frames == stats.output_frame_count == 12
+    assert stats.output_validation_status == "passed"
+    assert frames[1][20:44, 36:60].std() < 30
+    assert frames[0].mean() < frames[1].mean() < frames[2].mean()
+
+    decoded = subprocess.run(
+        [
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+            "-i", str(destination), "-map", "0:a:0",
+            "-ac", "1", "-ar", "48000", "-f", "f32le", "pipe:1",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    samples = np.frombuffer(decoded.stdout, dtype="<f4")
+    assert abs(len(samples) / 48000 - audio_duration) < 0.1
+    assert np.sqrt(np.mean(samples ** 2)) > 0.02
+    frequencies = np.fft.rfftfreq(len(samples), 1 / 48000)
+    dominant_frequency = frequencies[np.argmax(abs(np.fft.rfft(samples)))]
+    assert dominant_frequency == pytest.approx(440, abs=10)
+    assert list(tmp_path.glob(".public.*")) == []
+
+
+@pytest.mark.parametrize("suffix", [".mp4", ".m4v", ".mov", ".avi"])
+def test_silent_input_encodes_without_fabricated_audio(tmp_path, suffix):
+    source = tmp_path / "silent.avi"
+    destination = tmp_path / f"public{suffix}"
+    create_video(source, make_frames())
+
+    stats = process_video(
+        source, destination, FakeDetector(), settings=make_test_settings(tmp_path)
+    )
+
+    streams = probe_streams(destination)
+    assert len(streams) == 1
+    assert streams[0]["codec_type"] == "video"
+    assert streams[0]["codec_name"] == ("mjpeg" if suffix == ".avi" else "h264")
+    if suffix != ".avi":
+        assert streams[0]["pix_fmt"] == "yuv420p"
+        assert_faststart(destination)
+    assert len(read_all(destination)) == stats.output_frame_count == 3
+    assert list(tmp_path.glob(".public.*")) == []
+
+
+@pytest.mark.parametrize("missing_binary", [False, True])
+@pytest.mark.parametrize("existing_output", [False, True])
+def test_final_encoding_failure_never_publishes_or_leaves_temporary_files(
+    tmp_path, monkeypatch, missing_binary, existing_output
+):
+    source = tmp_path / "source.avi"
+    destination = tmp_path / "published.mp4"
+    create_video(source, make_frames())
+    if existing_output:
+        destination.write_bytes(b"previous published output")
+
+    def fail_encoding(command, **kwargs):
+        if missing_binary:
+            raise FileNotFoundError("ffmpeg")
+        Path(command[-1]).write_bytes(b"partial encoded output")
+        raise subprocess.CalledProcessError(
+            1, command, stderr="injected encoder failure"
+        )
+
+    monkeypatch.setattr("backend.app.video.processor.subprocess.run", fail_encoding)
+    message = "FFmpeg is required" if missing_binary else "injected encoder failure"
+    with pytest.raises(VideoProcessingError, match=message):
+        process_video(
+            source, destination, FakeDetector(), settings=make_test_settings(tmp_path)
+        )
+
+    if existing_output:
+        assert destination.read_bytes() == b"previous published output"
+    else:
+        assert not destination.exists()
+    assert list(tmp_path.glob(".published.*")) == []
 
 
 def test_processes_video_blurs_faces_and_verifies_output(tmp_path):
@@ -163,6 +312,80 @@ def test_missing_input_metadata_uses_documented_fps_fallback(tmp_path, monkeypat
     assert stats.input_frame_count is None
     assert stats.output_fps == 25.0
     assert stats.output_frame_count == 2
+
+
+@pytest.mark.parametrize("reported_count", [1, 5])
+def test_inaccurate_input_frame_metadata_preserves_all_decoded_frames(
+    tmp_path, monkeypatch, reported_count
+):
+    source = tmp_path / "estimated-count.avi"
+    destination = tmp_path / "estimated-count-output.avi"
+    create_video(source, make_frames())
+    real_capture = cv2.VideoCapture
+
+    class EstimatedCountCapture:
+        def __init__(self, path, *args, **kwargs):
+            self.is_source = str(path) == str(source)
+            self.wrapped = real_capture(path, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+        def get(self, prop):
+            if self.is_source and prop == cv2.CAP_PROP_FRAME_COUNT:
+                return reported_count
+            return self.wrapped.get(prop)
+
+    monkeypatch.setattr(
+        "backend.app.video.processor.cv2.VideoCapture", EstimatedCountCapture
+    )
+    detector = FakeDetector({2: [(31, 15, 65, 49)]})
+    stats = process_video(
+        source, destination, detector, settings=make_test_settings(tmp_path)
+    )
+
+    output_frames = read_all(destination)
+    assert stats.input_frame_count == reported_count
+    assert stats.processed_frames == stats.output_frame_count == len(output_frames) == 3
+    assert detector.calls == 3
+    assert output_frames[1][20:44, 36:60].std() < 30
+    frame_means = [frame.mean() for frame in output_frames]
+    assert frame_means[0] < frame_means[1] < frame_means[2]
+
+
+def test_dropped_output_frame_is_rejected_without_replacing_published_video(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "source.avi"
+    destination = tmp_path / "published.avi"
+    create_video(source, make_frames())
+    destination.write_bytes(b"previous published output")
+    real_writer = cv2.VideoWriter
+
+    class DroppingWriter:
+        def __init__(self, *args, **kwargs):
+            self.wrapped = real_writer(*args, **kwargs)
+            self.frames = 0
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+        def write(self, frame):
+            self.frames += 1
+            if self.frames != 3:
+                self.wrapped.write(frame)
+
+    monkeypatch.setattr("backend.app.video.processor.cv2.VideoWriter", DroppingWriter)
+    with pytest.raises(
+        VideoProcessingError,
+        match=r"Output frame count validation failed \(expected 3, got 2\)",
+    ):
+        process_video(
+            source, destination, FakeDetector(), settings=make_test_settings(tmp_path)
+        )
+
+    assert destination.read_bytes() == b"previous published output"
+    assert list(tmp_path.glob(".published.*.avi")) == []
 
 
 def test_invalid_boxes_do_not_fail_processing(tmp_path):
