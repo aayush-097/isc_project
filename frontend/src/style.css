@@ -63,9 +63,42 @@ h1 { margin-bottom: 12px; font: 700 clamp(29px, 4vw, 39px)/1.2 "Segoe UI", sans-
 .badge { display: inline-flex; align-items: center; border-radius: 20px; padding: 5px 9px; font-size: 10px; font-weight: 600; }
 .badge-neutral { color: #43735f; background: #e6f0e9; }
 .badge-pending { color: #8e7541; background: #f3efdf; }
+.badge-queued { color: #8e7541; background: #f3efdf; }
+.badge-processing { color: #426d9b; background: #eaf1fa; }
+.badge-completed { color: #347556; background: #e4f2e9; }
+.badge-failed { color: #a64e43; background: #fae9e6; }
 
 .upload-card, .form-card { padding: 34px; border: 1px solid #e7ebe6; border-radius: 10px; background: #fff; box-shadow: 0 8px 25px rgba(37, 59, 49, .035); }
 .upload-card { display: flex; flex-direction: column; align-items: center; text-align: center; }
+.upload-form { display: block; text-align: left; }
+.field-label { display: block; margin: 0 0 8px; color: #697670; font-size: 11px; font-weight: 600; }
+.text-input, .file-input { display: block; width: 100%; margin-bottom: 19px; color: #53625a; font-size: 12px; }
+.text-input { height: 42px; padding: 0 12px; border: 1px solid #e3e8e3; border-radius: 6px; outline: none; background: #f7f8f6; }
+.file-input { padding: 11px; border: 1px dashed #d8dfd9; border-radius: 6px; background: #fafbf9; }
+.selected-file { margin: -10px 0 18px; color: #65756d; font-size: 11px; overflow-wrap: anywhere; }
+.selected-file span { color: #929e97; }
+.upload-submit { margin: 8px 0 0; }
+.progress-bar { display: block; width: 100%; height: 7px; margin: 15px 0; accent-color: #28775f; }
+.message { padding: 12px 14px; border-radius: 6px; font-size: 12px; line-height: 1.6; }
+.message-error { color: #984b40; background: #fae9e6; }
+.message-success { color: #347556; background: #e4f2e9; }
+.processing-card { margin-top: 20px; padding: 22px; border: 1px solid #e7ebe6; border-radius: 9px; background: white; }
+.processing-heading, .video-card-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px; }
+.processing-heading h2, .video-card-heading h2 { margin: 0 0 7px; font: 700 16px "Segoe UI", sans-serif; }
+.processing-card .panel-copy { margin: 12px 0; }
+.processing-card .progress-bar { margin-bottom: 7px; }
+.library-link { display: inline-block; margin-top: 15px; }
+.metrics-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(125px, 1fr)); gap: 12px; margin: 18px 0; }
+.metrics-grid div { padding: 11px; border-radius: 6px; background: #f5f7f4; }
+.metrics-grid dt { color: #849089; font-size: 9px; }
+.metrics-grid dd { margin: 5px 0 0; color: #35433c; font-size: 12px; font-weight: 600; }
+.video-list { display: grid; gap: 14px; }
+.video-card { padding: 22px; border: 1px solid #e7ebe6; border-radius: 9px; background: white; }
+.video-card .metrics-grid { margin-bottom: 18px; }
+.video-player-card { padding: 14px; border: 1px solid #e7ebe6; border-radius: 9px; background: white; }
+.video-player-card video { display: block; width: 100%; max-height: 70vh; border-radius: 6px; background: #263c34; }
+.video-player-card .text-link { display: inline-block; margin: 13px 3px 3px; }
+.page-intro .badge { margin-left: 5px; text-transform: capitalize; }
 .upload-icon { display: grid; width: 46px; height: 46px; margin-bottom: 20px; place-items: center; border-radius: 13px; color: #42806a; background: #edf5ef; font-size: 25px; }
 .upload-card .button { margin-top: 5px; }
 .microcopy { margin: 13px 0 0; color: #a0a9a4; font-size: 10px; }

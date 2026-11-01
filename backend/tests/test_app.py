@@ -5,7 +5,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from backend.app.config import Settings
-from backend.app.db.database import connect_database
+from backend.app.db.database import SCHEMA, connect_database, initialize_database
 from backend.app.main import create_app
 
 
@@ -61,6 +61,41 @@ def test_database_initialization_preserves_existing_rows(tmp_path):
         ).fetchone()
 
     assert row == ("sample", "already-hashed")
+
+
+def test_additive_metrics_migration_preserves_existing_jobs(tmp_path):
+    database_path = tmp_path / "legacy.db"
+    legacy_schema = SCHEMA.replace("    metrics_json TEXT,\n", "")
+    assert legacy_schema != SCHEMA
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(legacy_schema)
+        connection.execute(
+            "INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)",
+            ("user-1", "sample", "already-hashed"),
+        )
+        connection.execute(
+            "INSERT INTO cases (id, title, owner_id, folder_path) VALUES (?, ?, ?, ?)",
+            ("case-1", "Existing case", "user-1", "existing/path"),
+        )
+        connection.execute(
+            "INSERT INTO jobs (id, case_id, status, progress) VALUES (?, ?, ?, ?)",
+            ("job-1", "case-1", "processing", 42),
+        )
+        connection.commit()
+
+    initialize_database(database_path)
+
+    with closing(connect_database(database_path)) as connection:
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(jobs)")
+        }
+        row = connection.execute(
+            "SELECT case_id, status, progress, metrics_json FROM jobs WHERE id = ?",
+            ("job-1",),
+        ).fetchone()
+
+    assert "metrics_json" in columns
+    assert row == ("case-1", "processing", 42, None)
 
 
 def test_database_connections_enforce_foreign_keys(tmp_path):

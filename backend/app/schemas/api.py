@@ -70,3 +70,51 @@ class JobResponse(BaseModel):
     status: Literal["pending", "processing", "completed", "failed"]
     progress: int = Field(ge=0, le=100)
     error: str | None = None
+
+
+VideoStatus = Literal["queued", "processing", "completed", "failed"]
+
+
+class VideoUploadResponse(BaseModel):
+    case_id: str
+    title: str
+    status: VideoStatus
+    message: str
+
+
+class VideoProcessingMetrics(BaseModel):
+    input_width: int
+    input_height: int
+    input_fps: float | None
+    input_frame_count: int | None
+    processed_frames: int
+    detected_face_instances: int
+    frames_with_detections: int
+    elapsed_seconds: float
+    processing_fps: float
+    output_frame_count: int
+    output_validation_status: str
+    gpu_acceleration_used: bool
+    output_fps: float
+
+
+class VideoStatusResponse(BaseModel):
+    case_id: str
+    title: str
+    status: VideoStatus
+    progress: int | None = None
+    error: str | None = None
+    metrics: VideoProcessingMetrics | None = None
+
+
+class VideoListItem(BaseModel):
+    case_id: str
+    title: str
+    status: VideoStatus
+    created_at: datetime
+    error: str | None = None
+    metrics: VideoProcessingMetrics | None = None
+
+
+class VideoListResponse(BaseModel):
+    videos: list[VideoListItem]

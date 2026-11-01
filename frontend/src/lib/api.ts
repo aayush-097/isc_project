@@ -60,6 +60,53 @@ export type RestoreStartResponse = {
   expires_in_seconds: number;
 };
 
+export type VideoStatus = "queued" | "processing" | "completed" | "failed";
+
+export type VideoProcessingMetrics = {
+  input_width: number;
+  input_height: number;
+  input_fps: number | null;
+  input_frame_count: number | null;
+  processed_frames: number;
+  detected_face_instances: number;
+  frames_with_detections: number;
+  elapsed_seconds: number;
+  processing_fps: number;
+  output_frame_count: number;
+  output_validation_status: string;
+  gpu_acceleration_used: boolean;
+  output_fps: number;
+};
+
+export type VideoUploadResponse = {
+  case_id: string;
+  title: string;
+  status: VideoStatus;
+  message: string;
+};
+
+export type VideoStatusResponse = {
+  case_id: string;
+  title: string;
+  status: VideoStatus;
+  progress: number | null;
+  error: string | null;
+  metrics: VideoProcessingMetrics | null;
+};
+
+export type VideoListItem = {
+  case_id: string;
+  title: string;
+  status: VideoStatus;
+  created_at: string;
+  error: string | null;
+  metrics: VideoProcessingMetrics | null;
+};
+
+export type VideoListResponse = {
+  videos: VideoListItem[];
+};
+
 const API_BASE = "/api";
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
@@ -75,6 +122,76 @@ export function getHealth(): Promise<HealthResponse> {
   return requestJson<HealthResponse>("/health");
 }
 
+export function listVideos(signal?: AbortSignal): Promise<VideoListResponse> {
+  return requestJson<VideoListResponse>("/videos", { signal });
+}
+
+export function getVideoStatus(
+  caseId: string,
+  signal?: AbortSignal,
+): Promise<VideoStatusResponse> {
+  return requestJson<VideoStatusResponse>(
+    `/videos/${encodeURIComponent(caseId)}/status`,
+    { signal },
+  );
+}
+
+export function getPublicVideoUrl(caseId: string): string {
+  return `${API_BASE}/videos/${encodeURIComponent(caseId)}/public`;
+}
+
+export function uploadVideo(
+  title: string,
+  file: File,
+  onProgress?: (percentage: number) => void,
+  signal?: AbortSignal,
+): Promise<VideoUploadResponse> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    const form = new FormData();
+    form.append("title", title);
+    form.append("video", file);
+
+    const abort = () => xhr.abort();
+    if (signal?.aborted) {
+      reject(new DOMException("Upload cancelled.", "AbortError"));
+      return;
+    }
+    signal?.addEventListener("abort", abort, { once: true });
+
+    xhr.open("POST", `${API_BASE}/videos/upload`);
+    xhr.upload.onprogress = (event) => {
+      if (event.lengthComputable && onProgress) {
+        onProgress(Math.round((event.loaded / event.total) * 100));
+      }
+    };
+    xhr.onerror = () => reject(new Error("Could not reach the video API."));
+    xhr.onabort = () => reject(new DOMException("Upload cancelled.", "AbortError"));
+    xhr.onload = () => {
+      let body: unknown;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        body = {};
+      }
+      if (xhr.status < 200 || xhr.status >= 300) {
+        const apiError = body as ApiError & { detail?: string };
+        reject(
+          new Error(
+            apiError.error?.message ??
+              apiError.detail ??
+              `Video upload failed (${xhr.status}).`,
+          ),
+        );
+        return;
+      }
+      resolve(body as VideoUploadResponse);
+    };
+    xhr.onloadend = () => signal?.removeEventListener("abort", abort);
+    xhr.send(form);
+  });
+}
+
 export const apiContract = {
   register: `${API_BASE}/auth/register`,
   login: `${API_BASE}/auth/login`,
@@ -88,4 +205,9 @@ export const apiContract = {
     `${API_BASE}/cases/${encodeURIComponent(id)}/restore/start`,
   restoreStream: (token: string) =>
     `${API_BASE}/restore/stream/${encodeURIComponent(token)}`,
+  uploadVideo: `${API_BASE}/videos/upload`,
+  videos: `${API_BASE}/videos`,
+  videoStatus: (id: string) =>
+    `${API_BASE}/videos/${encodeURIComponent(id)}/status`,
+  videoPublic: getPublicVideoUrl,
 } as const;

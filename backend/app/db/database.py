@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS jobs (
         CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
     progress INTEGER NOT NULL DEFAULT 0 CHECK (progress BETWEEN 0 AND 100),
     error TEXT,
+    metrics_json TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (case_id) REFERENCES cases (id) ON DELETE RESTRICT
@@ -58,3 +59,8 @@ def initialize_database(database_path: Path) -> None:
     with closing(connect_database(database_path)) as connection:
         connection.execute("PRAGMA journal_mode = WAL")
         connection.executescript(SCHEMA)
+        job_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(jobs)")
+        }
+        if "metrics_json" not in job_columns:
+            connection.execute("ALTER TABLE jobs ADD COLUMN metrics_json TEXT")

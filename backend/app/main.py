@@ -5,7 +5,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
-from backend.app.api import auth, cases, jobs, restore
+from backend.app.api import auth, cases, jobs, restore, videos
 from backend.app.config import Settings, get_settings
 from backend.app.db.database import initialize_database
 from backend.app.schemas.api import ErrorDetail, ErrorResponse, HealthResponse
@@ -23,13 +23,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="Reversible Face Privacy API",
         description=(
-            "Phase 1 API contract. Only the health endpoint is functional; "
-            "authentication, cases, jobs, verification, and restoration return HTTP 501."
+            "Development API for face-blurred video processing. Health and "
+            "development video upload/status/list/stream endpoints are functional. "
+            "Authentication, case ownership, verification, and restoration are deferred."
         ),
-        version="0.1.0",
+        version="0.2.5",
         lifespan=lifespan,
     )
     app.state.settings = app_settings
+    app.state.video_detector_factory = None
 
     @app.exception_handler(RequestValidationError)
     async def validation_error_handler(
@@ -76,6 +78,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.include_router(cases.router)
     app.include_router(jobs.router)
     app.include_router(restore.router)
+    app.include_router(videos.router)
     return app
 
 
