@@ -1,0 +1,97 @@
+from contextlib import closing
+import sqlite3
+
+import pytest
+from fastapi.testclient import TestClient
+
+from backend.app.config import Settings
+from backend.app.db.database import connect_database
+from backend.app.main import create_app
+
+
+def make_test_app(tmp_path):
+    settings = Settings(
+        database_path=tmp_path / "app.db",
+        storage_path=tmp_path / "cases",
+    )
+    return create_app(settings)
+
+
+def test_health_and_database_initialization(tmp_path):
+    app = make_test_app(tmp_path)
+    with TestClient(app) as client:
+        response = client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert (tmp_path / "cases").is_dir()
+
+    with closing(sqlite3.connect(tmp_path / "app.db")) as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
+
+    assert {"users", "cases", "jobs"} <= tables
+    assert journal_mode.lower() == "wal"
+
+
+def test_database_initialization_preserves_existing_rows(tmp_path):
+    app = make_test_app(tmp_path)
+    with TestClient(app):
+        pass
+
+    with closing(connect_database(tmp_path / "app.db")) as connection:
+        connection.execute(
+            "INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)",
+            ("user-1", "sample", "already-hashed"),
+        )
+        connection.commit()
+
+    with TestClient(app):
+        pass
+
+    with closing(connect_database(tmp_path / "app.db")) as connection:
+        row = connection.execute(
+            "SELECT username, password_hash FROM users WHERE id = ?",
+            ("user-1",),
+        ).fetchone()
+
+    assert row == ("sample", "already-hashed")
+
+
+def test_database_connections_enforce_foreign_keys(tmp_path):
+    with TestClient(make_test_app(tmp_path)):
+        pass
+
+    with closing(connect_database(tmp_path / "app.db")) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO cases (id, title, owner_id, folder_path) VALUES (?, ?, ?, ?)",
+                ("case-1", "Case", "missing-user", "not-exposed"),
+            )
+
+
+def test_openapi_exposes_contract_and_marks_stubs(tmp_path):
+    with TestClient(make_test_app(tmp_path)) as client:
+        response = client.get("/openapi.json")
+
+    assert response.status_code == 200
+    paths = response.json()["paths"]
+    assert paths["/health"]["get"]["responses"]["200"]
+    assert paths["/auth/register"]["post"]["responses"]["501"]
+    assert paths["/cases"]["post"]["requestBody"]
+    assert paths["/cases/{case_id}/restore/start"]["post"]["responses"]["501"]
+    assert paths["/restore/stream/{token}"]["get"]["responses"]["501"]
+    assert paths["/auth/register"]["post"]["responses"]["501"]["content"]
+
+
+def test_unimplemented_endpoint_returns_consistent_error(tmp_path):
+    with TestClient(make_test_app(tmp_path)) as client:
+        response = client.get("/auth/me")
+
+    assert response.status_code == 501
+    assert response.json()["error"]["code"] == "not_implemented"
