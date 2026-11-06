@@ -35,7 +35,7 @@ def test_health_and_database_initialization(tmp_path):
         }
         journal_mode = connection.execute("PRAGMA journal_mode").fetchone()[0]
 
-    assert {"users", "cases", "jobs"} <= tables
+    assert {"users", "cases", "jobs", "sessions"} <= tables
     assert journal_mode.lower() == "wal"
 
 
@@ -98,6 +98,70 @@ def test_additive_metrics_migration_preserves_existing_jobs(tmp_path):
     assert row == ("case-1", "processing", 42, None)
 
 
+def test_additive_video_metadata_migration_preserves_legacy_cases(tmp_path):
+    database_path = tmp_path / "legacy-cases.db"
+    case_columns = (
+        "    original_filename TEXT,\n"
+        "    original_relative_path TEXT,\n"
+        "    blurred_relative_path TEXT,\n"
+        "    processing_completed_at TEXT,\n"
+        "    duration_seconds REAL,\n"
+        "    video_width INTEGER,\n"
+        "    video_height INTEGER,\n"
+    )
+    legacy_schema = SCHEMA.replace(case_columns, "")
+    assert legacy_schema != SCHEMA
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.executescript(legacy_schema)
+        connection.execute(
+            "INSERT INTO users (id, username, password_hash) VALUES (?, ?, ?)",
+            ("development-upload-identity", "__development_uploads__", "disabled"),
+        )
+        connection.execute(
+            "INSERT INTO cases (id, title, owner_id, folder_path) VALUES (?, ?, ?, ?)",
+            (
+                "case_legacy",
+                "Unclaimed legacy case",
+                "development-upload-identity",
+                "storage/cases/case_legacy",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO jobs (id, case_id, status, progress) VALUES (?, ?, ?, ?)",
+            ("case_legacy", "case_legacy", "completed", 100),
+        )
+        connection.commit()
+
+    initialize_database(database_path)
+
+    with closing(connect_database(database_path)) as connection:
+        case_columns_after = {
+            row[1] for row in connection.execute("PRAGMA table_info(cases)")
+        }
+        case_row = connection.execute(
+            "SELECT title, owner_id, folder_path, original_relative_path, blurred_relative_path "
+            "FROM cases WHERE id = ?",
+            ("case_legacy",),
+        ).fetchone()
+
+    assert {
+        "original_filename",
+        "original_relative_path",
+        "blurred_relative_path",
+        "processing_completed_at",
+        "duration_seconds",
+        "video_width",
+        "video_height",
+    } <= case_columns_after
+    assert case_row == (
+        "Unclaimed legacy case",
+        "development-upload-identity",
+        "storage/cases/case_legacy",
+        None,
+        None,
+    )
+
+
 def test_database_connections_enforce_foreign_keys(tmp_path):
     with TestClient(make_test_app(tmp_path)):
         pass
@@ -118,16 +182,18 @@ def test_openapi_exposes_contract_and_marks_stubs(tmp_path):
     paths = response.json()["paths"]
     assert paths["/health"]["get"]["responses"]["200"]
     assert paths["/health/face-model"]["get"]["responses"]["200"]
-    assert paths["/auth/register"]["post"]["responses"]["501"]
+    assert paths["/auth/register"]["post"]["responses"]["201"]
+    assert paths["/auth/login"]["post"]["responses"]["200"]
+    assert paths["/auth/me"]["get"]["responses"]["200"]
     assert paths["/cases"]["post"]["requestBody"]
     assert paths["/cases/{case_id}/restore/start"]["post"]["responses"]["501"]
     assert paths["/restore/stream/{token}"]["get"]["responses"]["501"]
-    assert paths["/auth/register"]["post"]["responses"]["501"]["content"]
+    assert paths["/auth/logout"]["post"]["responses"]["200"]
 
 
 def test_unimplemented_endpoint_returns_consistent_error(tmp_path):
     with TestClient(make_test_app(tmp_path)) as client:
-        response = client.get("/auth/me")
+        response = client.get("/cases")
 
     assert response.status_code == 501
     assert response.json()["error"]["code"] == "not_implemented"

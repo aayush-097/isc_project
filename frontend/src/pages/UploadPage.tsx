@@ -35,7 +35,7 @@ function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-export default function UploadPage() {
+export default function UploadPage({ authenticated }: { authenticated: boolean }) {
   const [title, setTitle] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [validationError, setValidationError] = useState("");
@@ -143,6 +143,12 @@ export default function UploadPage() {
         progress: 0,
         error: null,
         metrics: null,
+        original_filename: null,
+        processing_completed_at: null,
+        duration_seconds: null,
+        video_width: null,
+        video_height: null,
+        is_owner: true,
       });
       window.dispatchEvent(new Event("videos-updated"));
     } catch (error) {
@@ -157,6 +163,15 @@ export default function UploadPage() {
 
   return (
     <section className="content content-narrow">
+      {!authenticated && (
+        <div className="empty-card">
+          <h2>Sign in to upload a video</h2>
+          <p>Uploaded video ownership is attached to your account.</p>
+          <a className="button" href="/login">Log in</a>
+        </div>
+      )}
+      {authenticated && (
+        <>
       <PageIntro
         eyebrow="New case"
         title="Upload a video"
@@ -222,7 +237,7 @@ export default function UploadPage() {
         )}
         <p className="form-note">
           Maximum 500 MB. Accepted formats depend on installed OpenCV codecs.
-          Upload and case endpoints are unauthenticated and for local development only.
+          Only your account can access the original source video.
         </p>
       </form>
 
@@ -270,6 +285,8 @@ export default function UploadPage() {
         </section>
       )}
       <a className="text-link back-link" href="/cases">← Back to library</a>
+        </>
+      )}
     </section>
   );
 }

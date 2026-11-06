@@ -30,8 +30,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         title="Reversible Face Privacy API",
         description=(
             "Development API for detected-person video blurring. Health and "
-            "development video upload/status/list/stream endpoints are functional. "
-            "Authentication, case ownership, verification, and restoration are deferred."
+            "authenticated video upload/status/list endpoints are functional. "
+            "Original video access is owner-only; validated blurred output is "
+            "available to other viewers. Verification and restoration are deferred."
         ),
         version="0.2.5",
         lifespan=lifespan,

@@ -17,7 +17,7 @@ def process_case_video(
     settings: Settings | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> ProcessingStats:
-    """Process an uploaded source to a fixed public.mp4 under configured case storage."""
+    """Process an uploaded source to a fixed processed/public.mp4 under case storage."""
     if not CASE_ID_PATTERN.fullmatch(case_id):
         raise ValueError("case_id must contain only letters, digits, underscores, or hyphens")
     app_settings = settings or get_settings()
@@ -28,9 +28,11 @@ def process_case_video(
     except ValueError as exc:
         raise ValueError("case output directory must remain inside configured storage") from exc
 
+    processed_directory = case_directory / "processed"
+    processed_directory.mkdir(parents=True, exist_ok=True)
     return process_video(
         input_path,
-        case_directory / "public.mp4",
+        processed_directory / "public.mp4",
         detector,
         settings=app_settings,
         progress_callback=progress_callback,

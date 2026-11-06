@@ -3,6 +3,8 @@ import shutil
 import sqlite3
 import uuid
 from collections.abc import Iterator
+from contextlib import closing
+import mimetypes
 from pathlib import Path, PurePosixPath
 
 import cv2
@@ -10,19 +12,21 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Reque
 from fastapi.responses import StreamingResponse
 
 from backend.app.ai.face_detector import FACE_MODEL_SETUP_MESSAGE, checkpoint_is_available
+from backend.app.api.auth import CurrentUser, require_csrf
 from backend.app.config import Settings
 from backend.app.schemas.api import (
     VideoListItem,
     VideoListResponse,
     VideoProcessingMetrics,
+    VideoPublicStatusResponse,
     VideoStatusResponse,
     VideoUploadResponse,
 )
 from backend.app.services.video_jobs import (
+    create_video_record,
     get_video_record,
     list_video_records,
     process_video_job,
-    create_video_record,
     _set_processing_status,
 )
 
@@ -43,23 +47,80 @@ def _case_directory(settings: Settings, case_id: str) -> Path:
         directory.relative_to(root)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail="Video case not found.") from exc
+    if directory.parent != root or directory.name != case_id:
+        raise HTTPException(status_code=404, detail="Video case not found.")
     return directory
 
 
 def _public_video_path(settings: Settings, case_id: str) -> Path:
     directory = _case_directory(settings, case_id)
-    output = (directory / "public.mp4").resolve()
+    record = get_video_record(settings.database_path, case_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Video case not found.")
+    relative_path = record.get("blurred_relative_path") or "public.mp4"
+    output = _stored_video_path(directory, relative_path)
+    if output is None and relative_path == "public.mp4":
+        output = _safe_case_child(directory, "public.mp4")
+    if output is None:
+        raise HTTPException(status_code=404, detail="Video output not found.")
+    return output
+
+
+def _safe_case_child(directory: Path, relative_path: str) -> Path | None:
+    parts = PurePosixPath(relative_path).parts
+    if (
+        not parts
+        or PurePosixPath(relative_path).is_absolute()
+        or any(part in {"", ".", ".."} for part in parts)
+        or "\\" in relative_path
+    ):
+        return None
+    output = directory.joinpath(*parts).resolve()
     try:
         output.relative_to(directory)
-    except ValueError as exc:
-        raise HTTPException(status_code=404, detail="Video output not found.") from exc
+    except ValueError:
+        return None
     return output
+
+
+def _stored_video_path(directory: Path, relative_path: str | None) -> Path | None:
+    return _safe_case_child(directory, relative_path) if relative_path else None
+
+
+def _original_video_path(settings: Settings, record: dict) -> Path | None:
+    directory = _case_directory(settings, record["case_id"])
+    stored_path = _stored_video_path(directory, record.get("original_relative_path"))
+    if stored_path is not None:
+        return stored_path
+    if record.get("original_relative_path"):
+        return None
+    legacy_sources = [
+        path
+        for path in directory.glob("original.*")
+        if path.suffix.lower() in SUPPORTED_EXTENSIONS and path.is_file()
+    ]
+    return (
+        _safe_case_child(directory, legacy_sources[0].name)
+        if len(legacy_sources) == 1
+        else None
+    )
+
+
+def _owned_record(settings: Settings, case_id: str, user_id: str) -> dict:
+    record = get_video_record(settings.database_path, case_id)
+    if record is None or record["owner_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Video case not found.")
+    return record
 
 
 def _status(record: dict, settings: Settings) -> VideoStatusResponse:
     status = record["job_status"]
     public_video = _public_video_path(settings, record["case_id"])
-    if status == "completed" and not public_video.is_file():
+    validated = (
+        record.get("metrics") is not None
+        and record["metrics"].get("output_validation_status") == "passed"
+    )
+    if status == "completed" and (not public_video.is_file() or not validated):
         _set_processing_status(
             settings.database_path,
             record["case_id"],
@@ -78,6 +139,12 @@ def _status(record: dict, settings: Settings) -> VideoStatusResponse:
         progress=record["progress"],
         error=record.get("error"),
         metrics=VideoProcessingMetrics(**record["metrics"]) if record.get("metrics") else None,
+        original_filename=record.get("original_filename"),
+        processing_completed_at=record.get("processing_completed_at"),
+        duration_seconds=record.get("duration_seconds"),
+        video_width=record.get("video_width"),
+        video_height=record.get("video_height"),
+        is_owner=True,
     )
 
 
@@ -112,9 +179,11 @@ def _validate_video_file(path: Path) -> None:
 async def upload_video(
     request: Request,
     background_tasks: BackgroundTasks,
+    current_user: CurrentUser,
     title: str = Form(..., min_length=1, max_length=200),
     video: UploadFile = File(...),
 ) -> VideoUploadResponse:
+    require_csrf(request, current_user)
     settings: Settings = request.app.state.settings
     cleaned_title = title.strip()
     if not cleaned_title:
@@ -137,12 +206,14 @@ async def upload_video(
 
     case_id = f"case_{uuid.uuid4().hex}"
     case_directory = _case_directory(settings, case_id)
-    original_path = case_directory / f"original{extension}"
+    original_directory = case_directory / "original"
+    original_path = original_directory / f"original{extension}"
     temporary_path = case_directory / f".upload{extension}.tmp"
     case_directory.mkdir(parents=True, exist_ok=False)
 
     total_bytes = 0
     try:
+        original_directory.mkdir()
         with temporary_path.open("xb") as destination:
             while chunk := await video.read(UPLOAD_CHUNK_SIZE):
                 total_bytes += len(chunk)
@@ -171,17 +242,17 @@ async def upload_video(
                 settings.database_path,
                 case_id=case_id,
                 title=cleaned_title,
+                owner_id=current_user["id"],
                 folder_path=case_directory,
+                original_filename=PurePosixPath(filename.replace("\\", "/")).name,
+                original_relative_path=f"original/original{extension}",
             )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=401, detail="Please sign in again.") from exc
         except sqlite3.Error as exc:
             raise HTTPException(
                 status_code=500,
                 detail="Could not create the video processing record.",
-            ) from exc
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=500,
-                detail="Could not initialize the development upload identity.",
             ) from exc
 
         background_tasks.add_task(
@@ -218,11 +289,11 @@ def retry_video(
     case_id: str,
     request: Request,
     background_tasks: BackgroundTasks,
+    current_user: CurrentUser,
 ) -> VideoUploadResponse:
     settings: Settings = request.app.state.settings
-    record = get_video_record(settings.database_path, case_id)
-    if record is None:
-        raise HTTPException(status_code=404, detail="Video case not found.")
+    require_csrf(request, current_user)
+    record = _owned_record(settings, case_id, current_user["id"])
     if record["job_status"] != "failed":
         raise HTTPException(
             status_code=409,
@@ -234,22 +305,12 @@ def retry_video(
     ):
         raise HTTPException(status_code=503, detail=FACE_MODEL_SETUP_MESSAGE)
 
-    case_directory = _case_directory(settings, case_id)
-    sources = [
-        path
-        for path in case_directory.glob("original.*")
-        if path.suffix.lower() in SUPPORTED_EXTENSIONS and path.is_file()
-    ]
-    if len(sources) != 1:
+    source_path = _original_video_path(settings, record)
+    if source_path is None or not source_path.is_file():
         raise HTTPException(
             status_code=409,
             detail="The original video is unavailable; upload the video again.",
         )
-    source_path = sources[0].resolve()
-    try:
-        source_path.relative_to(case_directory)
-    except ValueError as exc:
-        raise HTTPException(status_code=409, detail="The original video is unavailable.") from exc
 
     _set_processing_status(
         settings.database_path,
@@ -273,9 +334,9 @@ def retry_video(
 
 
 @router.get("", response_model=VideoListResponse)
-def list_videos(request: Request) -> VideoListResponse:
+def list_videos(request: Request, current_user: CurrentUser) -> VideoListResponse:
     settings: Settings = request.app.state.settings
-    records = list_video_records(settings.database_path)
+    records = list_video_records(settings.database_path, current_user["id"])
     items = []
     for record in records:
         state = _status(record, settings)
@@ -287,18 +348,43 @@ def list_videos(request: Request) -> VideoListResponse:
                 created_at=record["created_at"],
                 error=state.error,
                 metrics=state.metrics,
+                is_owner=True,
             )
         )
     return VideoListResponse(videos=items)
 
 
 @router.get("/{case_id}/status", response_model=VideoStatusResponse)
-def get_video_status(case_id: str, request: Request) -> VideoStatusResponse:
+def get_video_status(
+    case_id: str,
+    request: Request,
+    current_user: CurrentUser,
+) -> VideoStatusResponse:
+    settings: Settings = request.app.state.settings
+    record = _owned_record(settings, case_id, current_user["id"])
+    return _status(record, settings)
+
+
+@router.get("/{case_id}/public-status", response_model=VideoPublicStatusResponse)
+def get_public_video_status(case_id: str, request: Request) -> VideoPublicStatusResponse:
     settings: Settings = request.app.state.settings
     record = get_video_record(settings.database_path, case_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Video case not found.")
-    return _status(record, settings)
+    status = {"pending": "queued", "completed": "completed"}.get(
+        record["job_status"], record["job_status"]
+    )
+    if status == "completed":
+        metrics = record.get("metrics")
+        path = _public_video_path(settings, case_id)
+        if (
+            not metrics
+            or metrics.get("output_validation_status") != "passed"
+            or not path.is_file()
+            or path.stat().st_size == 0
+        ):
+            status = "failed"
+    return VideoPublicStatusResponse(status=status)
 
 
 def _parse_range(value: str, file_size: int) -> tuple[int, int]:
@@ -335,6 +421,7 @@ def _stream_file(path: Path, start: int, length: int) -> Iterator[bytes]:
 
 
 @router.get("/{case_id}/public")
+@router.get("/{case_id}/blurred", include_in_schema=False)
 def get_public_video(case_id: str, request: Request) -> StreamingResponse:
     settings: Settings = request.app.state.settings
     record = get_video_record(settings.database_path, case_id)
@@ -343,11 +430,17 @@ def get_public_video(case_id: str, request: Request) -> StreamingResponse:
     if record["job_status"] != "completed":
         raise HTTPException(
             status_code=409,
-            detail=f"Video is not available while processing status is '{record['job_status']}'.",
+            detail="Blurred video is available only after processing is complete.",
         )
 
     path = _public_video_path(settings, case_id)
-    if not path.is_file():
+    metrics = record.get("metrics")
+    if (
+        not metrics
+        or metrics.get("output_validation_status") != "passed"
+        or not path.is_file()
+        or path.stat().st_size == 0
+    ):
         _set_processing_status(
             settings.database_path,
             case_id,
@@ -356,10 +449,50 @@ def get_public_video(case_id: str, request: Request) -> StreamingResponse:
             error="Processed video output is unavailable; processing must be repeated.",
         )
         raise HTTPException(status_code=404, detail="Processed video output is unavailable.")
+    return _stream_video(path, request, "blurred.mp4", "video/mp4", private=False)
 
+@router.get("/{case_id}/original")
+def get_original_video(
+    case_id: str,
+    request: Request,
+    current_user: CurrentUser,
+) -> StreamingResponse:
+    settings: Settings = request.app.state.settings
+    record = _owned_record(settings, case_id, current_user["id"])
+    if record["job_status"] in {"pending", "processing"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Original video is unavailable while processing.",
+        )
+    path = _original_video_path(settings, record)
+    if path is None or not path.is_file() or path.stat().st_size == 0:
+        raise HTTPException(status_code=404, detail="Original video is unavailable.")
+    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+    return _stream_video(
+        path,
+        request,
+        f"original{path.suffix.lower()}",
+        media_type,
+        private=True,
+    )
+
+
+def _stream_video(
+    path: Path,
+    request: Request,
+    filename: str,
+    media_type: str,
+    *,
+    private: bool,
+) -> StreamingResponse:
     file_size = path.stat().st_size
-    if file_size == 0:
-        raise HTTPException(status_code=404, detail="Processed video output is unavailable.")
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(file_size),
+        "Content-Disposition": f'inline; filename="{filename}"',
+        "Cache-Control": "private, no-store" if private else "no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
     range_header = request.headers.get("range")
     if range_header:
         try:
@@ -371,26 +504,55 @@ def get_public_video(case_id: str, request: Request) -> StreamingResponse:
                 headers={"Content-Range": f"bytes */{file_size}"},
             ) from None
         length = end - start + 1
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+        headers["Content-Length"] = str(length)
         return StreamingResponse(
             _stream_file(path, start, length),
             status_code=206,
-            media_type="video/mp4",
-            headers={
-                "Accept-Ranges": "bytes",
-                "Content-Range": f"bytes {start}-{end}/{file_size}",
-                "Content-Length": str(length),
-                "Content-Disposition": 'inline; filename="public.mp4"',
-                "X-Content-Type-Options": "nosniff",
-            },
+            media_type=media_type,
+            headers=headers,
         )
-
     return StreamingResponse(
         _stream_file(path, 0, file_size),
-        media_type="video/mp4",
-        headers={
-            "Accept-Ranges": "bytes",
-            "Content-Length": str(file_size),
-            "Content-Disposition": 'inline; filename="public.mp4"',
-            "X-Content-Type-Options": "nosniff",
-        },
+        media_type=media_type,
+        headers=headers,
     )
+
+
+@router.delete("/{case_id}", status_code=204)
+def delete_video(
+    case_id: str,
+    request: Request,
+    current_user: CurrentUser,
+) -> None:
+    settings: Settings = request.app.state.settings
+    require_csrf(request, current_user)
+    record = _owned_record(settings, case_id, current_user["id"])
+    if record["job_status"] in {"pending", "processing"}:
+        raise HTTPException(status_code=409, detail="A video cannot be deleted while processing.")
+    case_directory = _case_directory(settings, case_id)
+    if not case_directory.exists():
+        raise HTTPException(status_code=404, detail="Video case files not found.")
+    trash_directory = case_directory.with_name(f".deleting-{case_id}-{uuid.uuid4().hex}")
+    try:
+        case_directory.rename(trash_directory)
+        with closing(sqlite3.connect(settings.database_path, timeout=30)) as connection:
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("DELETE FROM jobs WHERE case_id = ?", (case_id,))
+            deleted = connection.execute(
+                "DELETE FROM cases WHERE id = ? AND owner_id = ?",
+                (case_id, current_user["id"]),
+            ).rowcount
+            if deleted != 1:
+                raise HTTPException(status_code=404, detail="Video case not found.")
+            connection.commit()
+        shutil.rmtree(trash_directory)
+    except HTTPException:
+        if trash_directory.exists() and not case_directory.exists():
+            trash_directory.rename(case_directory)
+        raise
+    except (OSError, sqlite3.Error) as exc:
+        if trash_directory.exists() and not case_directory.exists():
+            trash_directory.rename(case_directory)
+        raise HTTPException(status_code=500, detail="Could not remove video case.") from exc

@@ -535,7 +535,7 @@ def test_case_service_keeps_output_under_storage_and_rejects_path_traversal(tmp_
     stats = process_case_video(source, "case_123", FakeDetector(), settings=settings)
 
     assert stats.output_validation_status == "passed"
-    assert (settings.storage_path / "case_123" / "public.mp4").is_file()
+    assert (settings.storage_path / "case_123" / "processed" / "public.mp4").is_file()
     with pytest.raises(ValueError, match="case_id"):
         process_case_video(source, "../outside", FakeDetector(), settings=settings)
 

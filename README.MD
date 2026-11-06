@@ -3,7 +3,7 @@
 An academic prototype for uploading videos, generating a public
 detected-person-blurred copy, and eventually enabling authorized restoration.
 Phases 1, 2, and 2.5 are implemented, including the development upload
-workflow. Production authentication, encryption, and restoration are not.
+workflow. Production deployment hardening, encryption, and restoration are not.
 
 ## Architecture
 
@@ -12,18 +12,21 @@ workflow. Production authentication, encryption, and restoration are not.
 - **Metadata:** SQLite (`storage/app.db` by default), initialized without
   deleting existing data and using WAL mode.
 - **Case storage:** `storage/cases/`.
-- **Development integration:** multipart upload, SQLite job status, processed
-  video streaming, and React upload/library/player screens.
+- **Video workflow:** authenticated multipart upload, owner-scoped library and
+  status, private original streaming, validated blurred streaming, and React
+  upload/library/player screens.
 - **Detector:** local `models/yolo26n.pt`, configured to detect the COCO
   `person` class and blur detected whole-person boxes. This is not face-only
   detection; people can be missed.
 - **Video pipeline:** sequential OpenCV frame processing with padded Gaussian
   blur and verified output publication.
 
-`GET /health` and the unauthenticated development video endpoints are
-functional. Authentication, ownership checks, case verification, restoration,
-and protected public access remain deferred. The video routes are intended
-only for local development and must not be exposed to untrusted networks.
+`GET /health`, account registration/login/logout, current-session lookup, and
+the video ownership/access workflow are functional. Authentication sessions
+are server-side and revocable, with Argon2 password hashes and CSRF-protected
+state-changing requests. Case verification and restoration remain deferred.
+The prototype is not a production deployment; configure HTTPS, secure cookies,
+and appropriate operational controls before exposing it beyond local use.
 
 ## Prerequisites
 
@@ -47,8 +50,9 @@ The backend reads these settings when it starts:
 | `DATABASE_PATH` | `storage/app.db` | SQLite database file |
 | `STORAGE_PATH` | `storage/cases` | Case-storage root |
 | `FRONTEND_ORIGIN` | `http://localhost:5173` | Planned frontend origin |
-| `SESSION_COOKIE_NAME` | `faceprivacy_session` | Planned session-cookie name |
-| `SESSION_COOKIE_SECURE` | `false` | Local-development cookie setting |
+| `SESSION_COOKIE_NAME` | `faceprivacy_session` | HttpOnly session-cookie name |
+| `SESSION_COOKIE_SECURE` | `false` | Set `true` when serving over HTTPS |
+| `SESSION_TTL_SECONDS` | `43200` | Session lifetime (12 hours by default) |
 | `FACE_MODEL_PATH` | `models/yolo26n.pt` | Local YOLO checkpoint |
 | `FACE_DETECTION_CLASS` | `person` | `person` blurs person boxes; `face` requires a face-specific checkpoint |
 | `FACE_CONFIDENCE_THRESHOLD` | `0.05` | YOLO detection confidence (low threshold for broader person coverage) |
@@ -86,8 +90,8 @@ python -m uvicorn backend.app.main:app --reload
 
 The API is available at <http://127.0.0.1:8000>, with interactive
 documentation at <http://127.0.0.1:8000/docs>. On startup, the app creates the
-configured storage directory, missing SQLite tables, and an additive jobs
-metrics column if needed; existing rows are not reset.
+configured storage directory, missing SQLite tables, and additive jobs/video
+metadata columns if needed; existing rows are not reset or reassigned.
 
 Check the health endpoint:
 
@@ -95,8 +99,44 @@ Check the health endpoint:
 Invoke-RestMethod http://127.0.0.1:8000/health
 ```
 
-Expected response: `{"status":"ok"}`. This indicates API responsiveness only;
-it does not indicate that authentication or person detection works.
+Expected response: `{"status":"ok"}`. This indicates API responsiveness only.
+
+## Accounts
+
+Open `/register` to create an account or `/login` to sign in. Usernames are
+normalized to lowercase and accept 3–64 letters, numbers, dots, underscores,
+and hyphens. Passwords must be at least 12 characters. Passwords are stored
+using Argon2id hashes. Successful registration and login create a 12-hour
+server-side session, returned as an HttpOnly, SameSite=Strict cookie. The raw
+session token is not stored in SQLite; only its SHA-256 hash is stored.
+`POST /auth/logout` revokes the current session and requires the per-session
+CSRF token. Five failed password attempts lock that account for 15 minutes.
+
+Set `SESSION_COOKIE_SECURE=true` when the app is served over HTTPS. The default
+development cookie is not marked Secure so it works on localhost. Login and
+registration enforce the configured `FRONTEND_ORIGIN` when the browser sends
+an Origin header.
+
+Video uploads require a signed-in account and CSRF token. The API assigns
+ownership from the authenticated session; the browser cannot select an owner.
+Library, status, retry, original-video, and delete operations are restricted to
+that owner. Other viewers can access only the blurred output after the
+processing pipeline validates its encoded dimensions and frame count. The
+original source is stored separately from the processed output, supports
+owner-authenticated byte-range requests, and is never used as a fallback for
+the blurred route. Original streaming is unavailable while processing.
+
+The database migration adds video metadata columns without deleting or
+reassigning existing cases. Legacy cases assigned to the reserved
+`__development_uploads__` identity are not visible to real accounts and their
+originals remain inaccessible; the migration does not guess ownership. Older
+validated blurred outputs may continue to be served through the legacy file
+layout only when their persisted processing metrics record successful output
+validation.
+
+New case files are separated under `storage/cases/<case-id>/original/` and
+`storage/cases/<case-id>/processed/`. The backend does not mount case storage
+as static files; all source access passes through the authenticated owner check.
 
 ## Frontend setup
 
@@ -175,8 +215,8 @@ python scripts\process_video.py --input PATH_TO_INPUT --output PATH_TO_OUTPUT
 Optional arguments include `--model`, `--confidence`, `--image-size`,
 `--device`, and `--blur-strength`. The CLI accepts explicit input and output
 paths. The service function `process_case_video` instead writes to a fixed
-`public.mp4` inside the configured storage directory and rejects invalid case
-IDs; the development upload endpoint invokes it in a background task.
+`processed/public.mp4` inside the configured case directory and rejects
+invalid case IDs; the upload endpoint invokes it in a background task.
 
 The JSON metrics report input dimensions, input frame rate and the
 container-reported frame-count estimate when available, processed frames, valid
@@ -245,28 +285,27 @@ and browser-compatible encoding. Older `mp4v` files can download successfully
 while failing in the browser player; the `.mp4` extension alone does not
 guarantee a supported video codec.
 
-Uploads, list/status endpoints, and public videos currently have no
-authentication or ownership checks. They store source videos locally and are
-not suitable for deployment or access from an untrusted network. The public
-video endpoint serves only completed, validated blurred output, never the
-uploaded original. Development cases use a reserved database identity with a
-non-usable password sentinel solely to satisfy the existing foreign-key
-schema; it is not an account or authentication mechanism.
+Uploads, private list/status endpoints, retries, original-video streaming, and
+deletion require an authenticated owner session. Other viewers can access only
+completed, validated blurred output. Older case records previously attached to
+the reserved `__development_uploads__` identity are deliberately not assigned
+to a real account; their originals are inaccessible through the API. The
+reserved identity is not a login or authentication mechanism.
 
 ## Implementation status
 
 | Area | Status |
 |---|---|
 | FastAPI app, health endpoint, OpenAPI contract | Implemented |
-| Authentication, sessions, authorization, rate limiting, CSRF | Deferred; endpoints return 501 |
-| SQLite schema and repeatable initialization | Implemented; no destructive migration |
+| Authentication, password hashing, revocable sessions, login lockout, CSRF protection | Implemented |
+| SQLite schema and repeatable initialization | Implemented; additive auth and video metadata migrations |
 | Standalone frame-by-frame face blur pipeline and tests | Implemented with injected test detectors |
 | YOLO26n person-box blur | Integrated with the local `models/yolo26n.pt`; whole detected people are blurred |
-| Development upload, job status, case listing, and blurred-video streaming | Implemented; unauthenticated and local-only |
-| Authentication, case ownership, secure deployment | Deferred |
-| Cryptography, manifests, integrity verification, restoration | Deferred |
-| React upload, case library, and playback screens | Implemented for development uploads |
-| Login and registration screens | Scaffolded; actions are disabled pending authentication |
+| Video upload, owner-only library/status/original/retry/delete, blurred sharing | Implemented |
+| Production deployment hardening, cryptography, restoration | Deferred |
+| Manifests, integrity verification, restoration | Deferred |
+| React upload, private library, and owner/shared playback screens | Implemented |
+| Login and registration screens | Functional; login state shown in navigation |
 | Face-model readiness status and Vite development proxy | Implemented |
 | YOLO26n training and dataset downloads | Training notebook supplied; runtime does not train or download |
 

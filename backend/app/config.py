@@ -67,6 +67,7 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:5173"
     session_cookie_name: str = "faceprivacy_session"
     session_cookie_secure: bool = False
+    session_ttl_seconds: int = Field(default=12 * 60 * 60, ge=300, le=30 * 24 * 60 * 60)
     face_model_path: Path = PROJECT_ROOT / "models" / "yolo26n.pt"
     face_detection_class: Literal["face", "person"] = "person"
     face_confidence_threshold: float = Field(default=0.05, ge=0, le=1)

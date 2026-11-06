@@ -1,7 +1,9 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+import re
+
+from pydantic import BaseModel, Field, field_validator
 
 
 class ErrorDetail(BaseModel):
@@ -27,12 +29,26 @@ class FaceModelStatusResponse(BaseModel):
 
 class CredentialsRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64)
-    password: str = Field(min_length=1, max_length=1024)
+    password: str = Field(min_length=12, max_length=1024)
+
+    @field_validator("username")
+    @classmethod
+    def normalize_username(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[a-z0-9_.-]{3,64}", normalized):
+            raise ValueError(
+                "Username must be 3-64 characters using letters, numbers, '.', '_' or '-'."
+            )
+        return normalized
 
 
 class UserResponse(BaseModel):
     id: str
     username: str
+
+
+class AuthResponse(UserResponse):
+    csrf_token: str
 
 
 class MessageResponse(BaseModel):
@@ -114,6 +130,12 @@ class VideoStatusResponse(BaseModel):
     progress: int | None = None
     error: str | None = None
     metrics: VideoProcessingMetrics | None = None
+    original_filename: str | None = None
+    processing_completed_at: datetime | None = None
+    duration_seconds: float | None = None
+    video_width: int | None = None
+    video_height: int | None = None
+    is_owner: bool = True
 
 
 class VideoListItem(BaseModel):
@@ -123,7 +145,12 @@ class VideoListItem(BaseModel):
     created_at: datetime
     error: str | None = None
     metrics: VideoProcessingMetrics | None = None
+    is_owner: bool
 
 
 class VideoListResponse(BaseModel):
     videos: list[VideoListItem]
+
+
+class VideoPublicStatusResponse(BaseModel):
+    status: VideoStatus

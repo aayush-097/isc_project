@@ -14,9 +14,6 @@ from backend.app.video.processor import ProcessingStats
 
 
 logger = logging.getLogger(__name__)
-DEVELOPMENT_OWNER_ID = "development-upload-identity"
-DEVELOPMENT_OWNER_USERNAME = "__development_uploads__"
-DEVELOPMENT_PASSWORD_SENTINEL = "!disabled-development-only!"
 
 
 def create_video_record(
@@ -24,34 +21,30 @@ def create_video_record(
     *,
     case_id: str,
     title: str,
+    owner_id: str,
     folder_path: Path,
+    original_filename: str,
+    original_relative_path: str,
 ) -> None:
     connection = connect_database(database_path)
     try:
         connection.execute("BEGIN")
         connection.execute(
             """
-            INSERT OR IGNORE INTO users (id, username, password_hash)
-            VALUES (?, ?, ?)
+            INSERT INTO cases (
+                id, title, owner_id, folder_path, original_filename,
+                original_relative_path, blurred_relative_path, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'processed/public.mp4', 'pending')
             """,
             (
-                DEVELOPMENT_OWNER_ID,
-                DEVELOPMENT_OWNER_USERNAME,
-                DEVELOPMENT_PASSWORD_SENTINEL,
+                case_id,
+                title,
+                owner_id,
+                str(folder_path),
+                original_filename,
+                original_relative_path,
             ),
-        )
-        identity = connection.execute(
-            "SELECT id FROM users WHERE id = ?",
-            (DEVELOPMENT_OWNER_ID,),
-        ).fetchone()
-        if identity is None:
-            raise RuntimeError("The reserved development upload identity is unavailable.")
-        connection.execute(
-            """
-            INSERT INTO cases (id, title, owner_id, folder_path, status)
-            VALUES (?, ?, ?, ?, 'pending')
-            """,
-            (case_id, title, DEVELOPMENT_OWNER_ID, str(folder_path)),
         )
         connection.execute(
             "INSERT INTO jobs (id, case_id, status, progress) VALUES (?, ?, 'pending', 0)",
@@ -69,9 +62,12 @@ def get_video_record(database_path: Path, case_id: str) -> dict[str, Any] | None
     with closing(connect_database(database_path)) as connection:
         row = connection.execute(
             """
-            SELECT cases.id, cases.title, cases.status AS case_status,
-                   cases.created_at, jobs.status AS job_status, jobs.progress,
-                   jobs.error, jobs.metrics_json
+            SELECT cases.id, cases.title, cases.owner_id,
+                   cases.status AS case_status, cases.created_at,
+                   cases.original_filename, cases.original_relative_path,
+                   cases.blurred_relative_path, cases.processing_completed_at,
+                   cases.duration_seconds, cases.video_width, cases.video_height,
+                   jobs.status AS job_status, jobs.progress, jobs.error, jobs.metrics_json
             FROM cases
             JOIN jobs ON jobs.case_id = cases.id
             WHERE cases.id = ?
@@ -83,39 +79,58 @@ def get_video_record(database_path: Path, case_id: str) -> dict[str, Any] | None
     return {
         "case_id": row[0],
         "title": row[1],
-        "case_status": row[2],
-        "created_at": row[3],
-        "job_status": row[4],
-        "progress": row[5],
-        "error": row[6],
-        "metrics": json.loads(row[7]) if row[7] else None,
+        "owner_id": row[2],
+        "case_status": row[3],
+        "created_at": row[4],
+        "original_filename": row[5],
+        "original_relative_path": row[6],
+        "blurred_relative_path": row[7],
+        "processing_completed_at": row[8],
+        "duration_seconds": row[9],
+        "video_width": row[10],
+        "video_height": row[11],
+        "job_status": row[12],
+        "progress": row[13],
+        "error": row[14],
+        "metrics": json.loads(row[15]) if row[15] else None,
     }
 
 
-def list_video_records(database_path: Path) -> list[dict[str, Any]]:
+def list_video_records(database_path: Path, owner_id: str) -> list[dict[str, Any]]:
     with closing(connect_database(database_path)) as connection:
         rows = connection.execute(
             """
-            SELECT cases.id, cases.title, cases.status AS case_status,
-                   cases.created_at, jobs.status AS job_status, jobs.progress,
-                   jobs.error, jobs.metrics_json
+            SELECT cases.id, cases.title, cases.owner_id,
+                   cases.status AS case_status, cases.created_at,
+                   cases.original_filename, cases.original_relative_path,
+                   cases.blurred_relative_path, cases.processing_completed_at,
+                   cases.duration_seconds, cases.video_width, cases.video_height,
+                   jobs.status AS job_status, jobs.progress, jobs.error, jobs.metrics_json
             FROM cases
             JOIN jobs ON jobs.case_id = cases.id
             WHERE cases.owner_id = ?
             ORDER BY cases.created_at DESC, cases.id DESC
             """,
-            (DEVELOPMENT_OWNER_ID,),
+            (owner_id,),
         ).fetchall()
     return [
         {
             "case_id": row[0],
             "title": row[1],
-            "case_status": row[2],
-            "created_at": row[3],
-            "job_status": row[4],
-            "progress": row[5],
-            "error": row[6],
-            "metrics": json.loads(row[7]) if row[7] else None,
+            "owner_id": row[2],
+            "case_status": row[3],
+            "created_at": row[4],
+            "original_filename": row[5],
+            "original_relative_path": row[6],
+            "blurred_relative_path": row[7],
+            "processing_completed_at": row[8],
+            "duration_seconds": row[9],
+            "video_width": row[10],
+            "video_height": row[11],
+            "job_status": row[12],
+            "progress": row[13],
+            "error": row[14],
+            "metrics": json.loads(row[15]) if row[15] else None,
         }
         for row in rows
     ]
@@ -132,6 +147,17 @@ def _set_processing_status(
 ) -> None:
     metrics_json = json.dumps(metrics.to_dict()) if metrics is not None else None
     case_status = "ready" if status == "completed" else status
+    completed_at = (
+        datetime.now(timezone.utc).isoformat() if status == "completed" else None
+    )
+    duration_seconds = None
+    video_width = None
+    video_height = None
+    if metrics is not None:
+        video_width = metrics.input_width
+        video_height = metrics.input_height
+        if metrics.input_fps and metrics.input_fps > 0 and metrics.processed_frames:
+            duration_seconds = metrics.processed_frames / metrics.input_fps
     with closing(connect_database(database_path)) as connection:
         try:
             connection.execute("BEGIN")
@@ -153,8 +179,22 @@ def _set_processing_status(
                 ),
             )
             connection.execute(
-                "UPDATE cases SET status = ? WHERE id = ?",
-                (case_status, case_id),
+                """
+                UPDATE cases
+                SET status = ?, processing_completed_at = ?,
+                    duration_seconds = COALESCE(?, duration_seconds),
+                    video_width = COALESCE(?, video_width),
+                    video_height = COALESCE(?, video_height)
+                WHERE id = ?
+                """,
+                (
+                    case_status,
+                    completed_at,
+                    duration_seconds,
+                    video_width,
+                    video_height,
+                    case_id,
+                ),
             )
             connection.commit()
         except Exception:

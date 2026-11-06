@@ -17,6 +17,16 @@ export type ApiError = {
   };
 };
 
+export class ApiRequestError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "ApiRequestError";
+  }
+}
+
 export type CredentialsRequest = {
   username: string;
   password: string;
@@ -25,6 +35,14 @@ export type CredentialsRequest = {
 export type UserResponse = {
   id: string;
   username: string;
+};
+
+export type AuthResponse = UserResponse & {
+  csrf_token: string;
+};
+
+export type MessageResponse = {
+  message: string;
 };
 
 export type CaseSummary = {
@@ -99,6 +117,12 @@ export type VideoStatusResponse = {
   progress: number | null;
   error: string | null;
   metrics: VideoProcessingMetrics | null;
+  original_filename: string | null;
+  processing_completed_at: string | null;
+  duration_seconds: number | null;
+  video_width: number | null;
+  video_height: number | null;
+  is_owner: boolean;
 };
 
 export type VideoListItem = {
@@ -108,25 +132,81 @@ export type VideoListItem = {
   created_at: string;
   error: string | null;
   metrics: VideoProcessingMetrics | null;
+  is_owner: boolean;
 };
 
 export type VideoListResponse = {
   videos: VideoListItem[];
 };
 
+export type VideoPublicStatusResponse = {
+  status: VideoStatus;
+};
+
 const API_BASE = "/api";
+let csrfToken = "";
+
+export function setCsrfToken(token: string): void {
+  csrfToken = token;
+}
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, init);
+  const headers = new Headers(init?.headers);
+  const method = (init?.method ?? "GET").toUpperCase();
+  if (method !== "GET" && csrfToken) headers.set("X-CSRF-Token", csrfToken);
+  const response = await fetch(`${API_BASE}${path}`, {
+    ...init,
+    headers,
+    credentials: "same-origin",
+  });
   if (!response.ok) {
     const body = (await response.json().catch(() => ({}))) as ApiError;
-    throw new Error(body.error?.message ?? `Request failed (${response.status}).`);
+    throw new ApiRequestError(
+      body.error?.message ?? `Request failed (${response.status}).`,
+      response.status,
+    );
   }
+  if (response.status === 204) return undefined as T;
   return (await response.json()) as T;
 }
 
 export function getHealth(): Promise<HealthResponse> {
   return requestJson<HealthResponse>("/health");
+}
+
+export function getCurrentUser(): Promise<AuthResponse> {
+  return requestJson<AuthResponse>("/auth/me");
+}
+
+export async function register(
+  username: string,
+  password: string,
+): Promise<AuthResponse> {
+  const result = await requestJson<AuthResponse>("/auth/register", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  setCsrfToken(result.csrf_token);
+  return result;
+}
+
+export async function login(
+  username: string,
+  password: string,
+): Promise<AuthResponse> {
+  const result = await requestJson<AuthResponse>("/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  setCsrfToken(result.csrf_token);
+  return result;
+}
+
+export async function logout(): Promise<void> {
+  await requestJson<MessageResponse>("/auth/logout", { method: "POST" });
+  setCsrfToken("");
 }
 
 export function getFaceModelStatus(): Promise<FaceModelStatusResponse> {
@@ -158,6 +238,26 @@ export function getPublicVideoUrl(caseId: string): string {
   return `${API_BASE}/videos/${encodeURIComponent(caseId)}/public`;
 }
 
+export function getOriginalVideoUrl(caseId: string): string {
+  return `${API_BASE}/videos/${encodeURIComponent(caseId)}/original`;
+}
+
+export function getPublicVideoStatus(
+  caseId: string,
+  signal?: AbortSignal,
+): Promise<VideoPublicStatusResponse> {
+  return requestJson<VideoPublicStatusResponse>(
+    `/videos/${encodeURIComponent(caseId)}/public-status`,
+    { signal },
+  );
+}
+
+export function deleteVideo(caseId: string): Promise<void> {
+  return requestJson<void>(`/videos/${encodeURIComponent(caseId)}`, {
+    method: "DELETE",
+  });
+}
+
 export function uploadVideo(
   title: string,
   file: File,
@@ -178,6 +278,7 @@ export function uploadVideo(
     signal?.addEventListener("abort", abort, { once: true });
 
     xhr.open("POST", `${API_BASE}/videos/upload`);
+    if (csrfToken) xhr.setRequestHeader("X-CSRF-Token", csrfToken);
     xhr.upload.onprogress = (event) => {
       if (event.lengthComputable && onProgress) {
         onProgress(Math.round((event.loaded / event.total) * 100));
@@ -230,5 +331,7 @@ export const apiContract = {
     `${API_BASE}/videos/${encodeURIComponent(id)}/status`,
   retryVideo: (id: string) =>
     `${API_BASE}/videos/${encodeURIComponent(id)}/retry`,
+  originalVideo: getOriginalVideoUrl,
+  deleteVideo: (id: string) => `${API_BASE}/videos/${encodeURIComponent(id)}`,
   videoPublic: getPublicVideoUrl,
 } as const;
