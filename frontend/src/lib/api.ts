@@ -2,6 +2,13 @@ export type HealthResponse = {
   status: "ok";
 };
 
+export type FaceModelStatusResponse = {
+  checkpoint_available: boolean;
+  checkpoint_name: string;
+  detection_class: "face" | "person";
+  message: string;
+};
+
 export type ApiError = {
   error?: {
     code?: string;
@@ -122,6 +129,10 @@ export function getHealth(): Promise<HealthResponse> {
   return requestJson<HealthResponse>("/health");
 }
 
+export function getFaceModelStatus(): Promise<FaceModelStatusResponse> {
+  return requestJson<FaceModelStatusResponse>("/health/face-model");
+}
+
 export function listVideos(signal?: AbortSignal): Promise<VideoListResponse> {
   return requestJson<VideoListResponse>("/videos", { signal });
 }
@@ -133,6 +144,13 @@ export function getVideoStatus(
   return requestJson<VideoStatusResponse>(
     `/videos/${encodeURIComponent(caseId)}/status`,
     { signal },
+  );
+}
+
+export function retryVideoProcessing(caseId: string): Promise<VideoUploadResponse> {
+  return requestJson<VideoUploadResponse>(
+    `/videos/${encodeURIComponent(caseId)}/retry`,
+    { method: "POST" },
   );
 }
 
@@ -193,6 +211,7 @@ export function uploadVideo(
 }
 
 export const apiContract = {
+  faceModelStatus: `${API_BASE}/health/face-model`,
   register: `${API_BASE}/auth/register`,
   login: `${API_BASE}/auth/login`,
   logout: `${API_BASE}/auth/logout`,
@@ -209,5 +228,7 @@ export const apiContract = {
   videos: `${API_BASE}/videos`,
   videoStatus: (id: string) =>
     `${API_BASE}/videos/${encodeURIComponent(id)}/status`,
+  retryVideo: (id: string) =>
+    `${API_BASE}/videos/${encodeURIComponent(id)}/retry`,
   videoPublic: getPublicVideoUrl,
 } as const;

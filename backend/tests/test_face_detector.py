@@ -71,8 +71,51 @@ def test_injected_yolo_model_rejects_non_face_checkpoint(tmp_path):
     class Model:
         names = {0: "person"}
 
-    with pytest.raises(FaceDetectionError, match="does not identify a face class"):
+    with pytest.raises(FaceDetectionError, match="does not identify the requested face class"):
         YoloFaceDetector(checkpoint, device="cpu", model_loader=lambda _: Model())
+
+
+def test_person_mode_uses_person_boxes_from_general_yolo_checkpoint(tmp_path):
+    checkpoint = tmp_path / "yolo26n.pt"
+    checkpoint.write_bytes(b"test checkpoint placeholder")
+
+    class TensorLike:
+        def __init__(self, value):
+            self.value = np.asarray(value)
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.value
+
+    class Boxes:
+        xyxy = TensorLike([[1, 2, 10, 12], [20, 22, 30, 32]])
+        cls = TensorLike([0, 1])
+
+    class Result:
+        boxes = Boxes()
+
+    class Model:
+        names = {0: "person", 1: "car"}
+
+        def predict(self, **kwargs):
+            assert kwargs["device"] == "cpu"
+            return [Result()]
+
+    detector = YoloFaceDetector(
+        checkpoint,
+        device="cpu",
+        target_class="person",
+        model_loader=lambda _: Model(),
+    )
+
+    assert detector.detect(np.zeros((40, 50, 3), dtype=np.uint8)) == [
+        (1.0, 2.0, 10.0, 12.0)
+    ]
 
 
 def test_explicit_cuda_request_fails_when_cuda_is_unavailable(tmp_path, monkeypatch):

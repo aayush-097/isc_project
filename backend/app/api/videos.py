@@ -9,6 +9,7 @@ import cv2
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 
+from backend.app.ai.face_detector import FACE_MODEL_SETUP_MESSAGE, checkpoint_is_available
 from backend.app.config import Settings
 from backend.app.schemas.api import (
     VideoListItem,
@@ -158,6 +159,12 @@ async def upload_video(
             raise HTTPException(status_code=400, detail="The uploaded video is empty.")
 
         _validate_video_file(temporary_path)
+        if (
+            getattr(request.app.state, "video_detector_factory", None) is None
+            and not checkpoint_is_available(settings.face_model_path)
+        ):
+            raise HTTPException(status_code=503, detail=FACE_MODEL_SETUP_MESSAGE)
+
         temporary_path.replace(original_path)
         try:
             create_video_record(
@@ -195,6 +202,74 @@ async def upload_video(
         raise
     finally:
         await video.close()
+
+
+@router.post(
+    "/{case_id}/retry",
+    response_model=VideoUploadResponse,
+    status_code=202,
+    responses={
+        404: {"description": "The video case does not exist."},
+        409: {"description": "The case is not retryable or its source is unavailable."},
+        503: {"description": "The configured face model checkpoint is unavailable."},
+    },
+)
+def retry_video(
+    case_id: str,
+    request: Request,
+    background_tasks: BackgroundTasks,
+) -> VideoUploadResponse:
+    settings: Settings = request.app.state.settings
+    record = get_video_record(settings.database_path, case_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Video case not found.")
+    if record["job_status"] != "failed":
+        raise HTTPException(
+            status_code=409,
+            detail="Only failed video cases can be retried.",
+        )
+    if (
+        getattr(request.app.state, "video_detector_factory", None) is None
+        and not checkpoint_is_available(settings.face_model_path)
+    ):
+        raise HTTPException(status_code=503, detail=FACE_MODEL_SETUP_MESSAGE)
+
+    case_directory = _case_directory(settings, case_id)
+    sources = [
+        path
+        for path in case_directory.glob("original.*")
+        if path.suffix.lower() in SUPPORTED_EXTENSIONS and path.is_file()
+    ]
+    if len(sources) != 1:
+        raise HTTPException(
+            status_code=409,
+            detail="The original video is unavailable; upload the video again.",
+        )
+    source_path = sources[0].resolve()
+    try:
+        source_path.relative_to(case_directory)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail="The original video is unavailable.") from exc
+
+    _set_processing_status(
+        settings.database_path,
+        case_id,
+        status="pending",
+        progress=0,
+    )
+    background_tasks.add_task(
+        process_video_job,
+        settings,
+        case_id,
+        source_path,
+        getattr(request.app.state, "video_detector_factory", None),
+    )
+    return VideoUploadResponse(
+        case_id=case_id,
+        title=record["title"],
+        status="queued",
+        message="Retry accepted. Video processing has been queued.",
+    )
 
 
 @router.get("", response_model=VideoListResponse)

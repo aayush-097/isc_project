@@ -15,6 +15,12 @@ class FaceDetectionError(RuntimeError):
     """Raised when a configured face detector cannot be used."""
 
 
+FACE_MODEL_SETUP_MESSAGE = (
+    "Detector checkpoint is missing or empty. Set FACE_MODEL_PATH to a local "
+    "YOLO checkpoint that contains the configured FACE_DETECTION_CLASS."
+)
+
+
 class Detector(Protocol):
     @property
     def gpu_acceleration_used(self) -> bool: ...
@@ -34,6 +40,11 @@ def validate_frame(frame: Frame) -> None:
         raise ValueError("frame must be a non-empty uint8 BGR image with 3 channels")
 
 
+def checkpoint_is_available(checkpoint_path: Path) -> bool:
+    checkpoint = Path(checkpoint_path).expanduser()
+    return checkpoint.is_file() and checkpoint.stat().st_size > 0
+
+
 class YoloFaceDetector:
     """Reusable Ultralytics detector that accepts face-specific checkpoints only."""
 
@@ -44,19 +55,21 @@ class YoloFaceDetector:
         confidence: float = 0.25,
         image_size: int = 960,
         device: str = "auto",
+        target_class: str = "face",
         model_loader: Callable[[Path], object] | None = None,
     ) -> None:
         if not 0 <= confidence <= 1:
             raise ValueError("confidence must be between 0 and 1")
         if image_size < 32:
             raise ValueError("image_size must be at least 32 pixels")
+        normalized_target = target_class.strip().lower()
+        if normalized_target not in {"face", "person"}:
+            raise ValueError("target_class must be face or person")
 
         checkpoint = Path(checkpoint_path).expanduser()
-        if not checkpoint.is_file() or checkpoint.stat().st_size == 0:
+        if not checkpoint_is_available(checkpoint):
             raise FaceDetectionError(
-                "The configured face model checkpoint is missing or empty. "
-                "Set FACE_MODEL_PATH to a local YOLO26n checkpoint fine-tuned "
-                "for face detection. No weights are downloaded automatically."
+                f"{FACE_MODEL_SETUP_MESSAGE} No weights are downloaded automatically."
             )
 
         self.checkpoint_path = checkpoint.resolve()
@@ -84,20 +97,21 @@ class YoloFaceDetector:
         else:
             name_items = []
 
-        face_indices = {
+        target_indices = {
             int(index)
             for index, name in name_items
-            if str(name).strip().lower() in {"face", "faces"}
+            if str(name).strip().lower()
+            in ({"face", "faces"} if normalized_target == "face" else {"person", "people"})
         }
-        if not face_indices:
+        if not target_indices:
             labels = ", ".join(str(name) for _, name in name_items) or "unavailable"
             raise FaceDetectionError(
-                "The configured checkpoint does not identify a face class "
+                f"The configured checkpoint does not identify the requested "
+                f"{normalized_target} class "
                 f"(reported classes: {labels}). Configure a face-specific "
-                "YOLO26n checkpoint; general-purpose detection weights are not "
-                "used as a fallback."
+                "or person-capable YOLO checkpoint as appropriate."
             )
-        self._face_class_indices = face_indices
+        self._target_class_indices = target_indices
 
     @staticmethod
     def _resolve_device(device: str) -> tuple[str, bool]:
@@ -177,12 +191,12 @@ class YoloFaceDetector:
                     classes = classes.numpy()
                 class_ids = np.asarray(classes).reshape(-1)
             else:
-                if len(self._face_class_indices) != 1:
+                if len(self._target_class_indices) != 1:
                     raise FaceDetectionError(
-                        "Face model omitted class IDs for a multi-class checkpoint."
+                        "Detector omitted class IDs for a multi-class checkpoint."
                     )
                 class_ids = np.full(
-                    len(coordinates), next(iter(self._face_class_indices)), dtype=np.int64
+                    len(coordinates), next(iter(self._target_class_indices)), dtype=np.int64
                 )
             if len(class_ids) != len(coordinates):
                 raise FaceDetectionError(
@@ -195,7 +209,7 @@ class YoloFaceDetector:
                     class_index = int(class_id)
                 except (TypeError, ValueError, OverflowError):
                     continue
-                if class_index not in self._face_class_indices:
+                if class_index not in self._target_class_indices:
                     continue
                 detections.append(tuple(float(value) for value in coordinates_row))
             return detections

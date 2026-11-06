@@ -18,6 +18,13 @@ class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
 
 
+class FaceModelStatusResponse(BaseModel):
+    checkpoint_available: bool
+    checkpoint_name: str
+    detection_class: Literal["face", "person"]
+    message: str
+
+
 class CredentialsRequest(BaseModel):
     username: str = Field(min_length=3, max_length=64)
     password: str = Field(min_length=1, max_length=1024)

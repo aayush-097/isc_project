@@ -117,6 +117,7 @@ def test_openapi_exposes_contract_and_marks_stubs(tmp_path):
     assert response.status_code == 200
     paths = response.json()["paths"]
     assert paths["/health"]["get"]["responses"]["200"]
+    assert paths["/health/face-model"]["get"]["responses"]["200"]
     assert paths["/auth/register"]["post"]["responses"]["501"]
     assert paths["/cases"]["post"]["requestBody"]
     assert paths["/cases/{case_id}/restore/start"]["post"]["responses"]["501"]

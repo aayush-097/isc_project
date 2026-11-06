@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from backend.app.ai.face_detector import Detector
+from backend.app.ai.face_detector import FACE_MODEL_SETUP_MESSAGE, Detector
 from backend.app.config import Settings
 from backend.app.db.database import connect_database
 from backend.app.services.video_processing import process_case_video
@@ -197,11 +197,7 @@ def process_video_job(
         )
     except Exception as exc:
         if "checkpoint is missing or empty" in str(exc).lower():
-            safe_error = (
-                "Face model checkpoint is missing. Configure FACE_MODEL_PATH with "
-                "a local face-specific YOLO26n checkpoint; no model is downloaded "
-                "automatically."
-            )
+            safe_error = FACE_MODEL_SETUP_MESSAGE
         elif "cuda" in str(exc).lower():
             safe_error = (
                 "Configured CUDA inference is unavailable. Check FACE_DEVICE, "

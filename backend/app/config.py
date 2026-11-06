@@ -1,7 +1,54 @@
+import os
+import shutil
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _add_ffmpeg_to_path() -> None:
+    """Ensure ffmpeg/ffprobe resolve even when a Windows install does not update PATH."""
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return
+
+    candidate_roots = [
+        Path.home() / "AppData" / "Local" / "Microsoft" / "WinGet" / "Packages",
+        Path("C:/Program Files"),
+        Path("C:/Program Files (x86)"),
+        Path("C:/"),
+        Path("/usr/bin"),
+        Path("/usr/local/bin"),
+    ]
+    resolved = None
+    for root in candidate_roots:
+        if not root.exists():
+            continue
+        for executable_name in ("ffmpeg", "ffprobe"):
+            if shutil.which(executable_name):
+                resolved = shutil.which(executable_name)
+                break
+            for match in root.glob(f"**/{executable_name}.exe"):
+                resolved = str(match)
+                break
+            if resolved:
+                break
+            for match in root.glob(f"**/{executable_name}"):
+                resolved = str(match)
+                break
+            if resolved:
+                break
+        if resolved:
+            break
+
+    if resolved:
+        ffmpeg_dir = str(Path(resolved).parent)
+        path_entries = [value for value in os.environ.get("PATH", "").split(os.pathsep) if value]
+        if ffmpeg_dir not in path_entries:
+            os.environ["PATH"] = os.pathsep.join([ffmpeg_dir, *path_entries])
+
+
+_add_ffmpeg_to_path()
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -20,9 +67,10 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:5173"
     session_cookie_name: str = "faceprivacy_session"
     session_cookie_secure: bool = False
-    face_model_path: Path = PROJECT_ROOT / "models" / "best.pt"
-    face_confidence_threshold: float = Field(default=0.25, ge=0, le=1)
-    face_image_size: int = Field(default=960, ge=32, le=4096)
+    face_model_path: Path = PROJECT_ROOT / "models" / "yolo26n.pt"
+    face_detection_class: Literal["face", "person"] = "person"
+    face_confidence_threshold: float = Field(default=0.05, ge=0, le=1)
+    face_image_size: int = Field(default=640, ge=32, le=4096)
     face_device: str = "auto"
     face_blur_strength: int = Field(default=99, ge=3, le=99)
     face_box_padding: float = Field(default=0.18, ge=0, le=1)
@@ -55,6 +103,14 @@ class Settings(BaseSettings):
         normalized = value.strip().lower()
         if normalized not in {"auto", "cpu", "cuda"} and not normalized.isdigit():
             raise ValueError("face_device must be auto, cpu, cuda, or a CUDA device index")
+        return normalized
+
+    @field_validator("face_detection_class", mode="before")
+    @classmethod
+    def normalize_face_detection_class(cls, value: str) -> str:
+        normalized = str(value).strip().lower()
+        if normalized not in {"face", "person"}:
+            raise ValueError("face_detection_class must be face or person")
         return normalized
 
 

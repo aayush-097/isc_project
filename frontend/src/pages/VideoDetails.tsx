@@ -89,7 +89,8 @@ export default function VideoDetails({ caseId }: { caseId: string }) {
           )}
           {status.metrics && <ProcessingMetrics metrics={status.metrics} />}
           <p className="status-note">
-            Frame-by-frame face detection can miss faces. A zero-detection result is not a privacy guarantee.
+            Person detection can miss people. This mode blurs detected whole-person boxes, not only faces; a
+            zero-detection result is not a privacy guarantee.
           </p>
         </>
       )}

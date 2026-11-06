@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useState } from "react";
 
 import { StatusBadge, ProcessingMetrics } from "../components/VideoComponents";
-import { listVideos, type VideoListItem } from "../lib/api";
+import { listVideos, retryVideoProcessing, type VideoListItem } from "../lib/api";
 
 export default function CaseLibrary() {
   const [videos, setVideos] = useState<VideoListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [retryingCaseId, setRetryingCaseId] = useState<string | null>(null);
+  const [retryErrors, setRetryErrors] = useState<Record<string, string>>({});
 
   const refresh = useCallback(async (signal?: AbortSignal) => {
     setLoading(true);
@@ -37,6 +39,27 @@ export default function CaseLibrary() {
   const hasActiveJobs = videos.some(
     (video) => video.status === "queued" || video.status === "processing",
   );
+
+  async function retry(caseId: string) {
+    setRetryingCaseId(caseId);
+    setRetryErrors((current) => {
+      const next = { ...current };
+      delete next[caseId];
+      return next;
+    });
+    try {
+      await retryVideoProcessing(caseId);
+      await refresh();
+    } catch (reason) {
+      setRetryErrors((current) => ({
+        ...current,
+        [caseId]: reason instanceof Error ? reason.message : "Could not retry video processing.",
+      }));
+    } finally {
+      setRetryingCaseId(null);
+    }
+  }
+
   useEffect(() => {
     if (!hasActiveJobs) return;
     const timer = window.setInterval(() => void refresh(), 2500);
@@ -48,7 +71,7 @@ export default function CaseLibrary() {
       <div className="page-intro">
         <p className="eyebrow">Your workspace</p>
         <h1>Case library</h1>
-        <p className="intro-copy">Development cases and their face-blurring processing status.</p>
+        <p className="intro-copy">Development cases and their detected-person blurring status.</p>
       </div>
       <div className="toolbar">
         <div className="filter-tabs"><span className="filter-active">All cases <span>{videos.length}</span></span></div>
@@ -87,7 +110,20 @@ export default function CaseLibrary() {
               {video.status === "completed" ? (
                 <a className="button button-small" href={`/cases/${encodeURIComponent(video.case_id)}`}>View blurred video</a>
               ) : video.status === "failed" ? (
-                <p className="message message-error">{video.error ?? "Video processing failed."}</p>
+                <>
+                  <p className="message message-error">{video.error ?? "Video processing failed."}</p>
+                  {retryErrors[video.case_id] && (
+                    <p className="message message-error" role="alert">{retryErrors[video.case_id]}</p>
+                  )}
+                  <button
+                    className="button button-small"
+                    disabled={retryingCaseId !== null}
+                    onClick={() => void retry(video.case_id)}
+                    type="button"
+                  >
+                    {retryingCaseId === video.case_id ? "Retrying…" : "Retry processing"}
+                  </button>
+                </>
               ) : (
                 <a className="text-link" href={`/cases/${encodeURIComponent(video.case_id)}`}>View processing status →</a>
               )}

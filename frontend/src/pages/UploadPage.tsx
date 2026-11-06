@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 
 import {
+  getFaceModelStatus,
   getVideoStatus,
   uploadVideo,
+  type FaceModelStatusResponse,
   type VideoStatusResponse,
 } from "../lib/api";
 import { formatFileSize, ProcessingMetrics, StatusBadge } from "../components/VideoComponents";
@@ -43,7 +45,27 @@ export default function UploadPage() {
   const [isUploading, setIsUploading] = useState(false);
   const [caseId, setCaseId] = useState("");
   const [videoStatus, setVideoStatus] = useState<VideoStatusResponse | null>(null);
+  const [faceModelStatus, setFaceModelStatus] = useState<FaceModelStatusResponse | null>(null);
+  const [faceModelStatusError, setFaceModelStatusError] = useState("");
   const uploadController = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    let active = true;
+    getFaceModelStatus()
+      .then((status) => {
+        if (active) setFaceModelStatus(status);
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setFaceModelStatusError(
+            error instanceof Error ? error.message : "Could not check the face model.",
+          );
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!caseId) return;
@@ -138,8 +160,25 @@ export default function UploadPage() {
       <PageIntro
         eyebrow="New case"
         title="Upload a video"
-        description="A local development workflow for creating and reviewing a face-blurred video."
+        description="A local development workflow for blurring detected people in videos."
       />
+      {!faceModelStatus && !faceModelStatusError && (
+        <p className="panel-copy" role="status">Checking face-model checkpoint…</p>
+      )}
+      {faceModelStatusError && (
+        <p className="message message-error" role="alert">{faceModelStatusError}</p>
+      )}
+      {faceModelStatus && (
+        <p
+          className={`message ${faceModelStatus.checkpoint_available ? "message-success" : "message-error"}`}
+          role={faceModelStatus.checkpoint_available ? "status" : "alert"}
+        >
+          {faceModelStatus.message}
+          {faceModelStatus.checkpoint_available && faceModelStatus.detection_class === "person"
+            ? " This blurs detected whole-person boxes, not just faces; people may still be missed."
+            : ""}
+        </p>
+      )}
       <form className="upload-card upload-form" onSubmit={handleSubmit}>
         <label className="field-label" htmlFor="case-title">Case title</label>
         <input
@@ -170,7 +209,11 @@ export default function UploadPage() {
         {validationError && <p className="message message-error" role="alert">{validationError}</p>}
         {uploadError && <p className="message message-error" role="alert">{uploadError}</p>}
         {!caseId && (
-          <button className="button button-full upload-submit" disabled={isUploading} type="submit">
+          <button
+            className="button button-full upload-submit"
+            disabled={isUploading || !faceModelStatus?.checkpoint_available}
+            type="submit"
+          >
             {isUploading ? `Uploading${uploadProgress === null ? "" : ` · ${uploadProgress}%`}` : "Upload and process video"}
           </button>
         )}

@@ -181,20 +181,45 @@ def test_processing_failure_is_reported_and_never_serves_output(api_environment)
     assert client.get(f"/videos/{case_id}/public").status_code == 409
 
 
-def test_missing_face_checkpoint_is_a_clear_failure(api_environment):
+def test_missing_face_checkpoint_is_reported_before_upload(api_environment):
     client, app, settings = api_environment
     settings.face_model_path = settings.storage_path / "missing-face-model.pt"
     app.state.video_detector_factory = None
 
-    response = upload(client)
-    assert response.status_code == 202
-    case_id = response.json()["case_id"]
-    status = client.get(f"/videos/{case_id}/status").json()
+    model_status = client.get("/health/face-model")
+    assert model_status.status_code == 200
+    assert model_status.json()["checkpoint_available"] is False
+    assert model_status.json()["checkpoint_name"] == "missing-face-model.pt"
+    assert model_status.json()["detection_class"] == "person"
+    assert "FACE_DETECTION_CLASS" in model_status.json()["message"]
 
-    assert status["status"] == "failed"
-    assert "Configure FACE_MODEL_PATH" in status["error"]
-    assert "missing-face-model" not in status["error"]
-    assert not (settings.storage_path / case_id / "public.mp4").exists()
+    response = upload(client)
+    assert response.status_code == 503
+    assert "FACE_DETECTION_CLASS" in response.json()["error"]["message"]
+    assert len(list(settings.storage_path.iterdir())) == 0
+
+
+def test_failed_case_can_be_retried_after_model_is_available(api_environment):
+    client, app, settings = api_environment
+    settings.face_model_path = settings.storage_path / "face-model.pt"
+    app.state.video_detector_factory = lambda: FakeDetector(fail=True)
+    upload_response = upload(client)
+    case_id = upload_response.json()["case_id"]
+    assert client.get(f"/videos/{case_id}/status").json()["status"] == "failed"
+
+    app.state.video_detector_factory = None
+    unavailable_retry = client.post(f"/videos/{case_id}/retry")
+    assert unavailable_retry.status_code == 503
+    assert client.get(f"/videos/{case_id}/status").json()["status"] == "failed"
+
+    settings.face_model_path.write_bytes(b"test checkpoint placeholder")
+    app.state.video_detector_factory = lambda: FakeDetector()
+    retry = client.post(f"/videos/{case_id}/retry")
+
+    assert retry.status_code == 202
+    assert retry.json()["case_id"] == case_id
+    assert retry.json()["status"] == "queued"
+    assert client.get(f"/videos/{case_id}/status").json()["status"] == "completed"
 
 
 def test_unknown_cases_and_path_traversal_are_rejected(api_environment):

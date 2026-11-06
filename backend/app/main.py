@@ -6,9 +6,15 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from backend.app.api import auth, cases, jobs, restore, videos
+from backend.app.ai.face_detector import FACE_MODEL_SETUP_MESSAGE, checkpoint_is_available
 from backend.app.config import Settings, get_settings
 from backend.app.db.database import initialize_database
-from backend.app.schemas.api import ErrorDetail, ErrorResponse, HealthResponse
+from backend.app.schemas.api import (
+    ErrorDetail,
+    ErrorResponse,
+    FaceModelStatusResponse,
+    HealthResponse,
+)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -23,7 +29,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="Reversible Face Privacy API",
         description=(
-            "Development API for face-blurred video processing. Health and "
+            "Development API for detected-person video blurring. Health and "
             "development video upload/status/list/stream endpoints are functional. "
             "Authentication, case ownership, verification, and restoration are deferred."
         ),
@@ -73,6 +79,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def health() -> HealthResponse:
         """Report that the API process is responsive."""
         return HealthResponse()
+
+    @app.get(
+        "/health/face-model",
+        response_model=FaceModelStatusResponse,
+        tags=["health"],
+    )
+    def face_model_status() -> FaceModelStatusResponse:
+        available = checkpoint_is_available(app_settings.face_model_path)
+        return FaceModelStatusResponse(
+            checkpoint_available=available,
+            checkpoint_name=app_settings.face_model_path.name,
+            detection_class=app_settings.face_detection_class,
+            message=(
+                f"The checkpoint file is present. The detector will validate its "
+                f"{app_settings.face_detection_class} class when inference starts."
+                if available
+                else FACE_MODEL_SETUP_MESSAGE
+            ),
+        )
 
     app.include_router(auth.router)
     app.include_router(cases.router)

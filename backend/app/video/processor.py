@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -90,8 +91,9 @@ def _verify_output(
 
 
 def _encode_output(intermediate: Path, source: Path, destination: Path) -> None:
+    ffmpeg_executable = shutil.which("ffmpeg") or "ffmpeg"
     command = [
-        "ffmpeg",
+        ffmpeg_executable,
         "-nostdin",
         "-hide_banner",
         "-loglevel",
@@ -180,6 +182,7 @@ def process_video(
                 confidence=app_settings.face_confidence_threshold,
                 image_size=app_settings.face_image_size,
                 device=app_settings.face_device,
+                target_class=app_settings.face_detection_class,
             )
         except FaceDetectionError as exc:
             raise VideoProcessingError(str(exc)) from exc
