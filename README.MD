@@ -1,9 +1,8 @@
 # Reversible Face Privacy for Video
 
-An academic prototype for uploading videos, generating a public
-detected-person-blurred copy, and eventually enabling authorized restoration.
-Phases 1, 2, and 2.5 are implemented, including the development upload
-workflow. Production deployment hardening, encryption, and restoration are not.
+An academic prototype for uploading videos, generating an authenticated
+detected-person-blurred copy, and protecting original videos with per-video
+passkeys and encryption. Production deployment hardening remains incomplete.
 
 ## Architecture
 
@@ -12,9 +11,11 @@ workflow. Production deployment hardening, encryption, and restoration are not.
 - **Metadata:** SQLite (`storage/app.db` by default), initialized without
   deleting existing data and using WAL mode.
 - **Case storage:** `storage/cases/`.
-- **Video workflow:** authenticated multipart upload, owner-scoped library and
-  status, private original streaming, validated blurred streaming, and React
-  upload/library/player screens.
+- **Video workflow:** authenticated uploads and library, owner-only retry/delete,
+  validated blurred streaming, and passkey-protected original streaming.
+- **Original-video protection:** AES-256-GCM chunk encryption at rest, per-video
+  random data keys wrapped using Argon2id-derived passkey keys, and short-lived
+  user/video/session-bound unlock grants.
 - **Detector:** local `models/yolo26n.pt`, configured to detect the COCO
   `person` class and blur detected whole-person boxes. This is not face-only
   detection; people can be missed.
@@ -22,11 +23,13 @@ workflow. Production deployment hardening, encryption, and restoration are not.
   blur and verified output publication.
 
 `GET /health`, account registration/login/logout, current-session lookup, and
-the video ownership/access workflow are functional. Authentication sessions
+the video processing and access workflow are functional. Authentication sessions
 are server-side and revocable, with Argon2 password hashes and CSRF-protected
 state-changing requests. Case verification and restoration remain deferred.
-The prototype is not a production deployment; configure HTTPS, secure cookies,
-and appropriate operational controls before exposing it beyond local use.
+Face-crop restoration remains deferred; original video access uses the
+per-video passkey workflow described below. The prototype is not a production
+deployment; configure HTTPS, secure cookies, and appropriate operational
+controls before exposing it beyond local use.
 
 ## Prerequisites
 
@@ -117,26 +120,29 @@ development cookie is not marked Secure so it works on localhost. Login and
 registration enforce the configured `FRONTEND_ORIGIN` when the browser sends
 an Origin header.
 
-Video uploads require a signed-in account and CSRF token. The API assigns
-ownership from the authenticated session; the browser cannot select an owner.
-Library, status, retry, original-video, and delete operations are restricted to
-that owner. Other viewers can access only the blurred output after the
-processing pipeline validates its encoded dimensions and frame count. The
-original source is stored separately from the processed output, supports
-owner-authenticated byte-range requests, and is never used as a fallback for
-the blurred route. Original streaming is unavailable while processing.
+Video uploads require a signed-in account and CSRF token. Ownership is assigned
+from the authenticated session and controls retry/delete actions. Any signed-in
+user can browse video metadata and validated blurred output. To access an
+original, a signed-in user must enter that video's passkey; successful unlocks
+create a five-minute grant bound to the video, user, and current session. Grants
+are revoked at logout, passkey attempts are limited to five failures per
+video/user every 15 minutes, and original responses are non-cacheable and
+support authenticated byte ranges. Originals are unavailable while processing.
+A lost passkey cannot be recovered.
 
-The database migration adds video metadata columns without deleting or
-reassigning existing cases. Legacy cases assigned to the reserved
-`__development_uploads__` identity are not visible to real accounts and their
-originals remain inaccessible; the migration does not guess ownership. Older
-validated blurred outputs may continue to be served through the legacy file
-layout only when their persisted processing metrics record successful output
-validation.
+Uploads are encrypted at rest using independent authenticated AES-256-GCM
+chunks. Each video has a random data-encryption key wrapped by a key derived
+from its passkey with Argon2id. The original is decrypted only into a temporary
+file while processing and that file is removed after the job. The backend does
+not mount case storage as static files. Blurred output is stored separately and
+served only after output validation.
 
-New case files are separated under `storage/cases/<case-id>/original/` and
-`storage/cases/<case-id>/processed/`. The backend does not mount case storage
-as static files; all source access passes through the authenticated owner check.
+Database migrations add video metadata, grant, and rate-limit tables without
+deleting existing data or guessing legacy ownership. Legacy cases remain
+visible to signed-in users and previously validated blurred output can still be
+served, but legacy originals without encryption metadata are never served.
+New files are stored under `storage/cases/<case-id>/encrypted/` and
+`storage/cases/<case-id>/processed/`.
 
 ## Frontend setup
 

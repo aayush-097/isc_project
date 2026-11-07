@@ -117,6 +117,7 @@ def get_session_record(request: Request) -> dict[str, Any]:
         "id": row[0],
         "username": row[1],
         "csrf_token": row[2],
+        "session_token_hash": _token_hash(token),
     }
 
 
@@ -283,14 +284,26 @@ def logout(
     require_csrf(request, current_user)
     token = request.cookies.get(_settings(request).session_cookie_name)
     if token:
+        token_hash = _token_hash(token)
         with closing(connect_database(_settings(request).database_path)) as connection:
             connection.execute(
-                "DELETE FROM sessions WHERE token_hash = ?", (_token_hash(token),)
+                "DELETE FROM video_unlock_grants WHERE session_token_hash = ?",
+                (token_hash,),
+            )
+            connection.execute(
+                "DELETE FROM sessions WHERE token_hash = ?", (token_hash,)
             )
             connection.commit()
     response.delete_cookie(
         key=_settings(request).session_cookie_name,
         path="/",
+        secure=_settings(request).session_cookie_secure,
+        httponly=True,
+        samesite="strict",
+    )
+    response.delete_cookie(
+        key="video_unlock_grant",
+        path="/api/videos",
         secure=_settings(request).session_cookie_secure,
         httponly=True,
         samesite="strict",

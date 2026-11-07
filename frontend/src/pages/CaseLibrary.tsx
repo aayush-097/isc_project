@@ -16,6 +16,7 @@ export default function CaseLibrary({ authenticated }: { authenticated: boolean 
   const [authRequired, setAuthRequired] = useState(false);
   const [retryingCaseId, setRetryingCaseId] = useState<string | null>(null);
   const [retryErrors, setRetryErrors] = useState<Record<string, string>>({});
+  const [retryPasskeys, setRetryPasskeys] = useState<Record<string, string>>({});
   const [deletingCaseId, setDeletingCaseId] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState("");
 
@@ -56,6 +57,14 @@ export default function CaseLibrary({ authenticated }: { authenticated: boolean 
   );
 
   async function retry(caseId: string) {
+    const passkey = retryPasskeys[caseId] ?? "";
+    if (passkey.length < 16 || passkey.length > 1024) {
+      setRetryErrors((current) => ({
+        ...current,
+        [caseId]: "Enter this video's passkey (16–1024 characters) to retry processing.",
+      }));
+      return;
+    }
     setRetryingCaseId(caseId);
     setRetryErrors((current) => {
       const next = { ...current };
@@ -63,7 +72,7 @@ export default function CaseLibrary({ authenticated }: { authenticated: boolean 
       return next;
     });
     try {
-      await retryVideoProcessing(caseId);
+      await retryVideoProcessing(caseId, passkey);
       await refresh();
     } catch (reason) {
       setRetryErrors((current) => ({
@@ -72,6 +81,11 @@ export default function CaseLibrary({ authenticated }: { authenticated: boolean 
       }));
     } finally {
       setRetryingCaseId(null);
+      setRetryPasskeys((current) => {
+        const next = { ...current };
+        delete next[caseId];
+        return next;
+      });
     }
   }
 
@@ -98,9 +112,9 @@ export default function CaseLibrary({ authenticated }: { authenticated: boolean 
   return (
     <section className="content">
       <div className="page-intro">
-        <p className="eyebrow">Your workspace</p>
-        <h1>Case library</h1>
-        <p className="intro-copy">Development cases and their detected-person blurring status.</p>
+        <p className="eyebrow">Video workspace</p>
+        <h1>Video library</h1>
+        <p className="intro-copy">Browse blurred videos and unlock originals with their video-specific passkeys.</p>
       </div>
       {!authenticated && (
         <div className="empty-card">
@@ -172,23 +186,52 @@ export default function CaseLibrary({ authenticated }: { authenticated: boolean 
                     <p className="message message-error" role="alert">{retryErrors[video.case_id]}</p>
                   )}
                   <div className="case-actions">
-                    <button
-                      className="button button-small"
-                      disabled={retryingCaseId !== null}
-                      onClick={() => void retry(video.case_id)}
-                      type="button"
-                    >
-                      {retryingCaseId === video.case_id ? "Retrying…" : "Retry processing"}
-                    </button>
+                    <a className="text-link" href={`/cases/${encodeURIComponent(video.case_id)}`}>View details →</a>
                     {video.is_owner && (
-                      <button
-                        className="button button-small button-danger"
-                        disabled={deletingCaseId !== null}
-                        onClick={() => void remove(video.case_id)}
-                        type="button"
-                      >
-                        {deletingCaseId === video.case_id ? "Deleting…" : "Delete case"}
-                      </button>
+                      <>
+                        <form
+                          className="upload-form retry-form"
+                          onSubmit={(event) => {
+                            event.preventDefault();
+                            void retry(video.case_id);
+                          }}
+                        >
+                          <label className="field-label" htmlFor={`retry-passkey-${video.case_id}`}>
+                            Video passkey required to retry
+                          </label>
+                          <input
+                            id={`retry-passkey-${video.case_id}`}
+                            className="text-input"
+                            autoComplete="off"
+                            maxLength={1024}
+                            minLength={16}
+                            onChange={(event) => setRetryPasskeys((current) => ({
+                              ...current,
+                              [video.case_id]: event.target.value,
+                            }))}
+                            required
+                            type="password"
+                            value={retryPasskeys[video.case_id] ?? ""}
+                          />
+                          <div className="case-actions">
+                            <button
+                              className="button button-small"
+                              disabled={retryingCaseId !== null || (retryPasskeys[video.case_id] ?? "").length < 16}
+                              type="submit"
+                            >
+                              {retryingCaseId === video.case_id ? "Retrying…" : "Retry processing"}
+                            </button>
+                            <button
+                              className="button button-small button-danger"
+                              disabled={deletingCaseId !== null}
+                              onClick={() => void remove(video.case_id)}
+                              type="button"
+                            >
+                              {deletingCaseId === video.case_id ? "Deleting…" : "Delete case"}
+                            </button>
+                          </div>
+                        </form>
+                      </>
                     )}
                   </div>
                 </>
@@ -211,7 +254,7 @@ export default function CaseLibrary({ authenticated }: { authenticated: boolean 
           ))}
         </div>
       )}
-      <p className="status-note">Your original videos are private to your account. Shared case pages provide blurred output only.</p>
+      <p className="status-note">Blurred videos are available to signed-in users. Originals require the video-specific passkey and a signed-in account.</p>
         </>
       )}
     </section>

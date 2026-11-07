@@ -1,25 +1,42 @@
+import hashlib
 import re
+import secrets
 import shutil
 import sqlite3
 import uuid
 from collections.abc import Iterator
 from contextlib import closing
 import mimetypes
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
 import cv2
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, Request, UploadFile
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    File,
+    Form,
+    HTTPException,
+    Request,
+    Response,
+    UploadFile,
+)
 from fastapi.responses import StreamingResponse
 
 from backend.app.ai.face_detector import FACE_MODEL_SETUP_MESSAGE, checkpoint_is_available
 from backend.app.api.auth import CurrentUser, require_csrf
 from backend.app.config import Settings
+from backend.app.db.database import connect_database
 from backend.app.schemas.api import (
     VideoListItem,
     VideoListResponse,
     VideoProcessingMetrics,
     VideoPublicStatusResponse,
+    VideoPasskeyRequest,
     VideoStatusResponse,
+    VideoUnlockResponse,
     VideoUploadResponse,
 )
 from backend.app.services.video_jobs import (
@@ -29,6 +46,14 @@ from backend.app.services.video_jobs import (
     process_video_job,
     _set_processing_status,
 )
+from backend.app.services.video_crypto import (
+    VideoCryptoError,
+    decrypt_video_range,
+    encrypt_video_file,
+    encrypted_video_size,
+    unwrap_video_key,
+    verify_video_range,
+)
 
 
 router = APIRouter(prefix="/videos", tags=["development videos"])
@@ -36,6 +61,11 @@ CASE_ID_PATTERN = re.compile(r"^case_[0-9a-f]{32}$")
 SUPPORTED_EXTENSIONS = {".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm"}
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 MAX_FILENAME_LENGTH = 255
+MIN_PASSKEY_LENGTH = 16
+VIDEO_GRANT_COOKIE = "video_unlock_grant"
+VIDEO_GRANT_TTL_SECONDS = 300
+MAX_PASSKEY_ATTEMPTS = 5
+PASSKEY_LOCKOUT = timedelta(minutes=15)
 
 
 def _case_directory(settings: Settings, case_id: str) -> Path:
@@ -87,30 +117,229 @@ def _stored_video_path(directory: Path, relative_path: str | None) -> Path | Non
     return _safe_case_child(directory, relative_path) if relative_path else None
 
 
-def _original_video_path(settings: Settings, record: dict) -> Path | None:
-    directory = _case_directory(settings, record["case_id"])
-    stored_path = _stored_video_path(directory, record.get("original_relative_path"))
-    if stored_path is not None:
-        return stored_path
-    if record.get("original_relative_path"):
+def _encrypted_video_path(settings: Settings, record: dict) -> Path | None:
+    if not record.get("wrapped_video_key"):
         return None
-    legacy_sources = [
-        path
-        for path in directory.glob("original.*")
-        if path.suffix.lower() in SUPPORTED_EXTENSIONS and path.is_file()
-    ]
-    return (
-        _safe_case_child(directory, legacy_sources[0].name)
-        if len(legacy_sources) == 1
-        else None
-    )
+    directory = _case_directory(settings, record["case_id"])
+    return _stored_video_path(directory, record.get("original_relative_path"))
+
+
+def _video_record(settings: Settings, case_id: str) -> dict:
+    record = get_video_record(settings.database_path, case_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Video case not found.")
+    return record
 
 
 def _owned_record(settings: Settings, case_id: str, user_id: str) -> dict:
-    record = get_video_record(settings.database_path, case_id)
-    if record is None or record["owner_id"] != user_id:
+    record = _video_record(settings, case_id)
+    if record["owner_id"] != user_id:
         raise HTTPException(status_code=404, detail="Video case not found.")
     return record
+
+
+def _check_passkey_rate_limit(settings: Settings, video_id: str, user_id: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(connect_database(settings.database_path)) as connection:
+        row = connection.execute(
+            """
+            SELECT failed_attempts, locked_until
+            FROM video_passkey_attempts
+            WHERE video_id = ? AND user_id = ?
+            """,
+            (video_id, user_id),
+        ).fetchone()
+        if row and row[1] and row[1] > now:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many incorrect passkey attempts. Try again later.",
+                headers={"Retry-After": str(int(PASSKEY_LOCKOUT.total_seconds()))},
+            )
+        if row and row[1]:
+            connection.execute(
+                """
+                UPDATE video_passkey_attempts
+                SET failed_attempts = 0, locked_until = NULL, updated_at = ?
+                WHERE video_id = ? AND user_id = ?
+                """,
+                (now, video_id, user_id),
+            )
+            connection.commit()
+
+
+def _record_passkey_failure(settings: Settings, video_id: str, user_id: str) -> None:
+    now = datetime.now(timezone.utc)
+    with closing(connect_database(settings.database_path)) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT failed_attempts
+                FROM video_passkey_attempts
+                WHERE video_id = ? AND user_id = ?
+                """,
+                (video_id, user_id),
+            ).fetchone()
+            failed_attempts = (row[0] if row else 0) + 1
+            locked_until = (
+                (now + PASSKEY_LOCKOUT).isoformat()
+                if failed_attempts >= MAX_PASSKEY_ATTEMPTS
+                else None
+            )
+            connection.execute(
+                """
+                INSERT INTO video_passkey_attempts (
+                    video_id, user_id, failed_attempts, locked_until, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(video_id, user_id) DO UPDATE SET
+                    failed_attempts = excluded.failed_attempts,
+                    locked_until = excluded.locked_until,
+                    updated_at = excluded.updated_at
+                """,
+                (video_id, user_id, failed_attempts, locked_until, now.isoformat()),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+
+
+def _verify_passkey(
+    settings: Settings,
+    record: dict,
+    user_id: str,
+    passkey: str,
+) -> tuple[bytes, Path]:
+    video_id = record["case_id"]
+    if not record.get("wrapped_video_key"):
+        raise HTTPException(
+            status_code=409,
+            detail="This legacy video has no passkey protection. Re-upload it to enable original access.",
+        )
+    encrypted_path = _encrypted_video_path(settings, record)
+    if encrypted_path is None or not encrypted_path.is_file():
+        raise HTTPException(status_code=404, detail="Protected original video is unavailable.")
+
+    _check_passkey_rate_limit(settings, video_id, user_id)
+    try:
+        data_key = unwrap_video_key(
+            video_id=video_id,
+            passkey=passkey,
+            salt=record["passkey_salt"],
+            wrapped_key=record["wrapped_video_key"],
+            wrap_nonce=record["key_wrap_nonce"],
+            crypto_version=record["crypto_version"],
+            crypto_algorithm=record["crypto_algorithm"],
+            key_wrap_algorithm=record["key_wrap_algorithm"],
+            kdf_time_cost=record["kdf_time_cost"],
+            kdf_memory_cost_kib=record["kdf_memory_cost_kib"],
+            kdf_parallelism=record["kdf_parallelism"],
+        )
+        encrypted_video_size(encrypted_path, record.get("encrypted_size"))
+    except (VideoCryptoError, TypeError, ValueError):
+        _record_passkey_failure(settings, video_id, user_id)
+        raise HTTPException(
+            status_code=401,
+            detail="Passkey is incorrect or protected original video is unavailable.",
+        ) from None
+
+    with closing(connect_database(settings.database_path)) as connection:
+        connection.execute(
+            """
+            DELETE FROM video_passkey_attempts
+            WHERE video_id = ? AND user_id = ?
+            """,
+            (video_id, user_id),
+        )
+        connection.commit()
+    return data_key, encrypted_path
+
+
+def _grant_token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _create_video_grant(
+    settings: Settings,
+    *,
+    video_id: str,
+    user_id: str,
+    session_token_hash: str,
+    data_key: bytes,
+) -> str:
+    token = secrets.token_urlsafe(32)
+    now = datetime.now(timezone.utc)
+    expires_at = (now + timedelta(seconds=VIDEO_GRANT_TTL_SECONDS)).isoformat()
+    wrap_nonce = secrets.token_bytes(12)
+    grant_key = hashlib.sha256(token.encode("ascii")).digest()
+    grant_aad = f"{video_id}:{user_id}:{session_token_hash}".encode("utf-8")
+    wrapped_video_key = AESGCM(grant_key).encrypt(wrap_nonce, data_key, grant_aad)
+    with closing(connect_database(settings.database_path)) as connection:
+        connection.execute("DELETE FROM video_unlock_grants WHERE expires_at <= ?", (now.isoformat(),))
+        connection.execute(
+            """
+            INSERT INTO video_unlock_grants (
+                token_hash, video_id, user_id, session_token_hash,
+                grant_wrapped_video_key, grant_wrap_nonce, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _grant_token_hash(token),
+                video_id,
+                user_id,
+                session_token_hash,
+                wrapped_video_key,
+                wrap_nonce,
+                expires_at,
+            ),
+        )
+        connection.commit()
+    return token
+
+
+def _require_video_grant(
+    settings: Settings,
+    request: Request,
+    record: dict,
+    current_user: dict,
+) -> bytes:
+    token = request.cookies.get(VIDEO_GRANT_COOKIE)
+    if not token:
+        raise HTTPException(status_code=403, detail="Unlock this video's original with its passkey.")
+    now = datetime.now(timezone.utc).isoformat()
+    with closing(connect_database(settings.database_path)) as connection:
+        row = connection.execute(
+            """
+            SELECT grant_wrapped_video_key, grant_wrap_nonce FROM video_unlock_grants
+            WHERE token_hash = ? AND video_id = ? AND user_id = ?
+              AND session_token_hash = ? AND expires_at > ?
+            """,
+            (
+                _grant_token_hash(token),
+                record["case_id"],
+                current_user["id"],
+                current_user["session_token_hash"],
+                now,
+            ),
+        ).fetchone()
+        connection.execute("DELETE FROM video_unlock_grants WHERE expires_at <= ?", (now,))
+        connection.commit()
+    if row is None:
+        raise HTTPException(status_code=403, detail="Unlock this video's original with its passkey.")
+    grant_key = hashlib.sha256(token.encode("ascii")).digest()
+    grant_aad = (
+        f"{record['case_id']}:{current_user['id']}:"
+        f"{current_user['session_token_hash']}"
+    ).encode("utf-8")
+    try:
+        return AESGCM(grant_key).decrypt(row[1], row[0], grant_aad)
+    except (InvalidTag, ValueError):
+        raise HTTPException(
+            status_code=403,
+            detail="Unlock this video's original with its passkey.",
+        ) from None
 
 
 def _status(record: dict, settings: Settings) -> VideoStatusResponse:
@@ -144,7 +373,8 @@ def _status(record: dict, settings: Settings) -> VideoStatusResponse:
         duration_seconds=record.get("duration_seconds"),
         video_width=record.get("video_width"),
         video_height=record.get("video_height"),
-        is_owner=True,
+        is_owner=False,
+        original_protected=bool(record.get("wrapped_video_key")),
     )
 
 
@@ -181,6 +411,8 @@ async def upload_video(
     background_tasks: BackgroundTasks,
     current_user: CurrentUser,
     title: str = Form(..., min_length=1, max_length=200),
+    passkey: str = Form(..., min_length=MIN_PASSKEY_LENGTH, max_length=1024),
+    confirm_passkey: str = Form(..., min_length=MIN_PASSKEY_LENGTH, max_length=1024),
     video: UploadFile = File(...),
 ) -> VideoUploadResponse:
     require_csrf(request, current_user)
@@ -188,6 +420,8 @@ async def upload_video(
     cleaned_title = title.strip()
     if not cleaned_title:
         raise HTTPException(status_code=422, detail="Case title cannot be empty.")
+    if not secrets.compare_digest(passkey, confirm_passkey):
+        raise HTTPException(status_code=422, detail="Passkey entries do not match.")
 
     filename = video.filename
     if (
@@ -206,14 +440,13 @@ async def upload_video(
 
     case_id = f"case_{uuid.uuid4().hex}"
     case_directory = _case_directory(settings, case_id)
-    original_directory = case_directory / "original"
-    original_path = original_directory / f"original{extension}"
+    encrypted_directory = case_directory / "encrypted"
+    encrypted_path = encrypted_directory / "original.enc"
     temporary_path = case_directory / f".upload{extension}.tmp"
     case_directory.mkdir(parents=True, exist_ok=False)
 
     total_bytes = 0
     try:
-        original_directory.mkdir()
         with temporary_path.open("xb") as destination:
             while chunk := await video.read(UPLOAD_CHUNK_SIZE):
                 total_bytes += len(chunk)
@@ -236,7 +469,13 @@ async def upload_video(
         ):
             raise HTTPException(status_code=503, detail=FACE_MODEL_SETUP_MESSAGE)
 
-        temporary_path.replace(original_path)
+        data_key, crypto_metadata = encrypt_video_file(
+            temporary_path,
+            encrypted_path,
+            video_id=case_id,
+            passkey=passkey,
+        )
+        temporary_path.unlink()
         try:
             create_video_record(
                 settings.database_path,
@@ -245,7 +484,8 @@ async def upload_video(
                 owner_id=current_user["id"],
                 folder_path=case_directory,
                 original_filename=PurePosixPath(filename.replace("\\", "/")).name,
-                original_relative_path=f"original/original{extension}",
+                original_relative_path="encrypted/original.enc",
+                crypto_metadata=crypto_metadata,
             )
         except sqlite3.IntegrityError as exc:
             raise HTTPException(status_code=401, detail="Please sign in again.") from exc
@@ -259,7 +499,9 @@ async def upload_video(
             process_video_job,
             settings,
             case_id,
-            original_path,
+            encrypted_path,
+            data_key,
+            crypto_metadata["encrypted_size"],
             getattr(request.app.state, "video_detector_factory", None),
         )
         return VideoUploadResponse(
@@ -290,6 +532,7 @@ def retry_video(
     request: Request,
     background_tasks: BackgroundTasks,
     current_user: CurrentUser,
+    payload: VideoPasskeyRequest,
 ) -> VideoUploadResponse:
     settings: Settings = request.app.state.settings
     require_csrf(request, current_user)
@@ -305,12 +548,12 @@ def retry_video(
     ):
         raise HTTPException(status_code=503, detail=FACE_MODEL_SETUP_MESSAGE)
 
-    source_path = _original_video_path(settings, record)
-    if source_path is None or not source_path.is_file():
-        raise HTTPException(
-            status_code=409,
-            detail="The original video is unavailable; upload the video again.",
-        )
+    data_key, encrypted_path = _verify_passkey(
+        settings,
+        record,
+        current_user["id"],
+        payload.passkey,
+    )
 
     _set_processing_status(
         settings.database_path,
@@ -322,7 +565,9 @@ def retry_video(
         process_video_job,
         settings,
         case_id,
-        source_path,
+        encrypted_path,
+        data_key,
+        record["encrypted_size"],
         getattr(request.app.state, "video_detector_factory", None),
     )
     return VideoUploadResponse(
@@ -336,7 +581,7 @@ def retry_video(
 @router.get("", response_model=VideoListResponse)
 def list_videos(request: Request, current_user: CurrentUser) -> VideoListResponse:
     settings: Settings = request.app.state.settings
-    records = list_video_records(settings.database_path, current_user["id"])
+    records = list_video_records(settings.database_path)
     items = []
     for record in records:
         state = _status(record, settings)
@@ -348,7 +593,7 @@ def list_videos(request: Request, current_user: CurrentUser) -> VideoListRespons
                 created_at=record["created_at"],
                 error=state.error,
                 metrics=state.metrics,
-                is_owner=True,
+                is_owner=record["owner_id"] == current_user["id"],
             )
         )
     return VideoListResponse(videos=items)
@@ -361,12 +606,76 @@ def get_video_status(
     current_user: CurrentUser,
 ) -> VideoStatusResponse:
     settings: Settings = request.app.state.settings
-    record = _owned_record(settings, case_id, current_user["id"])
-    return _status(record, settings)
+    record = _video_record(settings, case_id)
+    return _status_for_user(record, settings, current_user["id"])
 
+
+@router.get("/{case_id}", response_model=VideoStatusResponse)
+def get_video_details(
+    case_id: str,
+    request: Request,
+    current_user: CurrentUser,
+) -> VideoStatusResponse:
+    record = _video_record(request.app.state.settings, case_id)
+    return _status_for_user(record, request.app.state.settings, current_user["id"])
+
+
+@router.post(
+    "/{case_id}/unlock",
+    response_model=VideoUnlockResponse,
+    responses={
+        401: {"description": "Passkey is incorrect or the protected original is unavailable."},
+        429: {"description": "Passkey attempts are temporarily rate limited."},
+    },
+)
+def unlock_video_original(
+    case_id: str,
+    payload: VideoPasskeyRequest,
+    request: Request,
+    response: Response,
+    current_user: CurrentUser,
+) -> VideoUnlockResponse:
+    settings: Settings = request.app.state.settings
+    require_csrf(request, current_user)
+    record = _video_record(settings, case_id)
+    if record["job_status"] in {"pending", "processing"}:
+        raise HTTPException(
+            status_code=409,
+            detail="The original video cannot be unlocked while processing is in progress.",
+        )
+    data_key, _ = _verify_passkey(settings, record, current_user["id"], payload.passkey)
+    grant_token = _create_video_grant(
+        settings,
+        video_id=case_id,
+        user_id=current_user["id"],
+        session_token_hash=current_user["session_token_hash"],
+        data_key=data_key,
+    )
+    response.set_cookie(
+        key=VIDEO_GRANT_COOKIE,
+        value=grant_token,
+        max_age=VIDEO_GRANT_TTL_SECONDS,
+        path="/api/videos",
+        secure=settings.session_cookie_secure,
+        httponly=True,
+        samesite="strict",
+    )
+    return VideoUnlockResponse(
+        message="Original video unlocked for this session.",
+        expires_in_seconds=VIDEO_GRANT_TTL_SECONDS,
+    )
+
+
+def _status_for_user(record: dict, settings: Settings, user_id: str) -> VideoStatusResponse:
+    status = _status(record, settings)
+    return status.model_copy(update={"is_owner": record["owner_id"] == user_id})
 
 @router.get("/{case_id}/public-status", response_model=VideoPublicStatusResponse)
-def get_public_video_status(case_id: str, request: Request) -> VideoPublicStatusResponse:
+def get_public_video_status(
+    case_id: str,
+    request: Request,
+    current_user: CurrentUser,
+) -> VideoPublicStatusResponse:
     settings: Settings = request.app.state.settings
     record = get_video_record(settings.database_path, case_id)
     if record is None:
@@ -422,7 +731,11 @@ def _stream_file(path: Path, start: int, length: int) -> Iterator[bytes]:
 
 @router.get("/{case_id}/public")
 @router.get("/{case_id}/blurred", include_in_schema=False)
-def get_public_video(case_id: str, request: Request) -> StreamingResponse:
+def get_public_video(
+    case_id: str,
+    request: Request,
+    current_user: CurrentUser,
+) -> StreamingResponse:
     settings: Settings = request.app.state.settings
     record = get_video_record(settings.database_path, case_id)
     if record is None:
@@ -458,22 +771,68 @@ def get_original_video(
     current_user: CurrentUser,
 ) -> StreamingResponse:
     settings: Settings = request.app.state.settings
-    record = _owned_record(settings, case_id, current_user["id"])
+    record = _video_record(settings, case_id)
     if record["job_status"] in {"pending", "processing"}:
         raise HTTPException(
             status_code=409,
             detail="Original video is unavailable while processing.",
         )
-    path = _original_video_path(settings, record)
-    if path is None or not path.is_file() or path.stat().st_size == 0:
-        raise HTTPException(status_code=404, detail="Original video is unavailable.")
-    media_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-    return _stream_video(
-        path,
-        request,
-        f"original{path.suffix.lower()}",
-        media_type,
-        private=True,
+    data_key = _require_video_grant(settings, request, record, current_user)
+    path = _encrypted_video_path(settings, record)
+    if path is None or not path.is_file():
+        raise HTTPException(status_code=404, detail="Protected original video is unavailable.")
+    try:
+        plain_size = encrypted_video_size(path, record.get("encrypted_size"))
+    except VideoCryptoError:
+        raise HTTPException(status_code=404, detail="Protected original video is unavailable.") from None
+    range_header = request.headers.get("range")
+    if range_header:
+        try:
+            start, end = _parse_range(range_header, plain_size)
+        except (ValueError, OverflowError):
+            raise HTTPException(
+                status_code=416,
+                detail="Requested video byte range is not satisfiable.",
+                headers={"Content-Range": f"bytes */{plain_size}"},
+            ) from None
+    else:
+        start, end = 0, plain_size - 1
+    try:
+        verify_video_range(
+            path,
+            video_id=case_id,
+            data_key=data_key,
+            start=start,
+            end=end,
+        )
+    except (VideoCryptoError, ValueError):
+        raise HTTPException(status_code=404, detail="Protected original video is unavailable.") from None
+
+    extension = PurePosixPath((record.get("original_filename") or "original.mp4").replace("\\", "/")).suffix.lower()
+    media_type = mimetypes.guess_type(f"original{extension}")[0] or "application/octet-stream"
+    content_length = end - start + 1
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Length": str(content_length),
+        "Content-Disposition": f'inline; filename="original{extension}"',
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
+    response_status = 200
+    if range_header:
+        response_status = 206
+        headers["Content-Range"] = f"bytes {start}-{end}/{plain_size}"
+    return StreamingResponse(
+        decrypt_video_range(
+            path,
+            video_id=case_id,
+            data_key=data_key,
+            start=start,
+            end=end,
+        ),
+        status_code=response_status,
+        media_type=media_type,
+        headers=headers,
     )
 
 

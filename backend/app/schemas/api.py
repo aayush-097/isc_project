@@ -105,6 +105,16 @@ class VideoUploadResponse(BaseModel):
     message: str
 
 
+class VideoPasskeyRequest(BaseModel):
+    passkey: str = Field(min_length=16, max_length=1024)
+    confirm_passkey: str | None = Field(default=None, min_length=16, max_length=1024)
+
+
+class VideoUnlockResponse(BaseModel):
+    message: str
+    expires_in_seconds: int
+
+
 class VideoProcessingMetrics(BaseModel):
     input_width: int
     input_height: int
@@ -136,6 +146,7 @@ class VideoStatusResponse(BaseModel):
     video_width: int | None = None
     video_height: int | None = None
     is_owner: bool = True
+    original_protected: bool = False
 
 
 class VideoListItem(BaseModel):

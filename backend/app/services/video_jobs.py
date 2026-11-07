@@ -9,6 +9,7 @@ from typing import Any
 from backend.app.ai.face_detector import FACE_MODEL_SETUP_MESSAGE, Detector
 from backend.app.config import Settings
 from backend.app.db.database import connect_database
+from backend.app.services.video_crypto import decrypt_video_to_file
 from backend.app.services.video_processing import process_case_video
 from backend.app.video.processor import ProcessingStats
 
@@ -25,6 +26,7 @@ def create_video_record(
     folder_path: Path,
     original_filename: str,
     original_relative_path: str,
+    crypto_metadata: dict[str, bytes | int | str],
 ) -> None:
     connection = connect_database(database_path)
     try:
@@ -33,9 +35,12 @@ def create_video_record(
             """
             INSERT INTO cases (
                 id, title, owner_id, folder_path, original_filename,
-                original_relative_path, blurred_relative_path, status
+                original_relative_path, blurred_relative_path, passkey_salt,
+                wrapped_video_key, key_wrap_nonce, crypto_version,
+                crypto_algorithm, key_wrap_algorithm, kdf_time_cost,
+                kdf_memory_cost_kib, kdf_parallelism, encrypted_size, status
             )
-            VALUES (?, ?, ?, ?, ?, ?, 'processed/public.mp4', 'pending')
+            VALUES (?, ?, ?, ?, ?, ?, 'processed/public.mp4', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             """,
             (
                 case_id,
@@ -44,6 +49,16 @@ def create_video_record(
                 str(folder_path),
                 original_filename,
                 original_relative_path,
+                crypto_metadata["salt"],
+                crypto_metadata["wrapped_key"],
+                crypto_metadata["wrap_nonce"],
+                crypto_metadata["crypto_version"],
+                crypto_metadata["crypto_algorithm"],
+                crypto_metadata["key_wrap_algorithm"],
+                crypto_metadata["kdf_time_cost"],
+                crypto_metadata["kdf_memory_cost_kib"],
+                crypto_metadata["kdf_parallelism"],
+                crypto_metadata["encrypted_size"],
             ),
         )
         connection.execute(
@@ -62,12 +77,17 @@ def get_video_record(database_path: Path, case_id: str) -> dict[str, Any] | None
     with closing(connect_database(database_path)) as connection:
         row = connection.execute(
             """
-            SELECT cases.id, cases.title, cases.owner_id,
-                   cases.status AS case_status, cases.created_at,
-                   cases.original_filename, cases.original_relative_path,
-                   cases.blurred_relative_path, cases.processing_completed_at,
-                   cases.duration_seconds, cases.video_width, cases.video_height,
-                   jobs.status AS job_status, jobs.progress, jobs.error, jobs.metrics_json
+            SELECT cases.id, cases.title, cases.owner_id, cases.status,
+                   cases.created_at, cases.original_filename,
+                   cases.original_relative_path, cases.blurred_relative_path,
+                   cases.processing_completed_at, cases.duration_seconds,
+                   cases.video_width, cases.video_height, cases.passkey_salt,
+                   cases.wrapped_video_key, cases.key_wrap_nonce,
+                   cases.crypto_version, cases.crypto_algorithm,
+                   cases.key_wrap_algorithm, cases.kdf_time_cost,
+                   cases.kdf_memory_cost_kib, cases.kdf_parallelism,
+                   cases.encrypted_size, jobs.status, jobs.progress,
+                   jobs.error, jobs.metrics_json
             FROM cases
             JOIN jobs ON jobs.case_id = cases.id
             WHERE cases.id = ?
@@ -76,6 +96,10 @@ def get_video_record(database_path: Path, case_id: str) -> dict[str, Any] | None
         ).fetchone()
     if row is None:
         return None
+    return _video_record_dict(row)
+
+
+def _video_record_dict(row: tuple[Any, ...]) -> dict[str, Any]:
     return {
         "case_id": row[0],
         "title": row[1],
@@ -89,51 +113,44 @@ def get_video_record(database_path: Path, case_id: str) -> dict[str, Any] | None
         "duration_seconds": row[9],
         "video_width": row[10],
         "video_height": row[11],
-        "job_status": row[12],
-        "progress": row[13],
-        "error": row[14],
-        "metrics": json.loads(row[15]) if row[15] else None,
+        "passkey_salt": row[12],
+        "wrapped_video_key": row[13],
+        "key_wrap_nonce": row[14],
+        "crypto_version": row[15],
+        "crypto_algorithm": row[16],
+        "key_wrap_algorithm": row[17],
+        "kdf_time_cost": row[18],
+        "kdf_memory_cost_kib": row[19],
+        "kdf_parallelism": row[20],
+        "encrypted_size": row[21],
+        "job_status": row[22],
+        "progress": row[23],
+        "error": row[24],
+        "metrics": json.loads(row[25]) if row[25] else None,
     }
 
 
-def list_video_records(database_path: Path, owner_id: str) -> list[dict[str, Any]]:
+def list_video_records(database_path: Path) -> list[dict[str, Any]]:
     with closing(connect_database(database_path)) as connection:
         rows = connection.execute(
             """
-            SELECT cases.id, cases.title, cases.owner_id,
-                   cases.status AS case_status, cases.created_at,
-                   cases.original_filename, cases.original_relative_path,
-                   cases.blurred_relative_path, cases.processing_completed_at,
-                   cases.duration_seconds, cases.video_width, cases.video_height,
-                   jobs.status AS job_status, jobs.progress, jobs.error, jobs.metrics_json
+            SELECT cases.id, cases.title, cases.owner_id, cases.status,
+                   cases.created_at, cases.original_filename,
+                   cases.original_relative_path, cases.blurred_relative_path,
+                   cases.processing_completed_at, cases.duration_seconds,
+                   cases.video_width, cases.video_height, cases.passkey_salt,
+                   cases.wrapped_video_key, cases.key_wrap_nonce,
+                   cases.crypto_version, cases.crypto_algorithm,
+                   cases.key_wrap_algorithm, cases.kdf_time_cost,
+                   cases.kdf_memory_cost_kib, cases.kdf_parallelism,
+                   cases.encrypted_size, jobs.status, jobs.progress,
+                   jobs.error, jobs.metrics_json
             FROM cases
             JOIN jobs ON jobs.case_id = cases.id
-            WHERE cases.owner_id = ?
             ORDER BY cases.created_at DESC, cases.id DESC
-            """,
-            (owner_id,),
+            """
         ).fetchall()
-    return [
-        {
-            "case_id": row[0],
-            "title": row[1],
-            "owner_id": row[2],
-            "case_status": row[3],
-            "created_at": row[4],
-            "original_filename": row[5],
-            "original_relative_path": row[6],
-            "blurred_relative_path": row[7],
-            "processing_completed_at": row[8],
-            "duration_seconds": row[9],
-            "video_width": row[10],
-            "video_height": row[11],
-            "job_status": row[12],
-            "progress": row[13],
-            "error": row[14],
-            "metrics": json.loads(row[15]) if row[15] else None,
-        }
-        for row in rows
-    ]
+    return [_video_record_dict(row) for row in rows]
 
 
 def _set_processing_status(
@@ -205,11 +222,21 @@ def _set_processing_status(
 def process_video_job(
     settings: Settings,
     case_id: str,
-    source_path: Path,
+    encrypted_path: Path,
+    data_key: bytes,
+    encrypted_size: int,
     detector_factory: Any = None,
 ) -> None:
     database_path = settings.database_path
+    source_path = settings.storage_path / case_id / ".processing-source.tmp"
     try:
+        decrypt_video_to_file(
+            encrypted_path,
+            source_path,
+            video_id=case_id,
+            data_key=data_key,
+            expected_size=encrypted_size,
+        )
         _set_processing_status(
             database_path, case_id, status="processing", progress=0
         )
@@ -253,3 +280,5 @@ def process_video_job(
             progress=0,
             error=safe_error,
         )
+    finally:
+        source_path.unlink(missing_ok=True)

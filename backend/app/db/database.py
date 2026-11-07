@@ -27,6 +27,16 @@ CREATE TABLE IF NOT EXISTS cases (
     duration_seconds REAL,
     video_width INTEGER,
     video_height INTEGER,
+    passkey_salt BLOB,
+    wrapped_video_key BLOB,
+    key_wrap_nonce BLOB,
+    crypto_version INTEGER,
+    crypto_algorithm TEXT,
+    key_wrap_algorithm TEXT,
+    kdf_time_cost INTEGER,
+    kdf_memory_cost_kib INTEGER,
+    kdf_parallelism INTEGER,
+    encrypted_size INTEGER,
     status TEXT NOT NULL DEFAULT 'pending'
         CHECK (status IN ('pending', 'processing', 'ready', 'failed')),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -55,9 +65,35 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS video_unlock_grants (
+    token_hash TEXT PRIMARY KEY,
+    video_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    session_token_hash TEXT NOT NULL,
+    grant_wrapped_video_key BLOB NOT NULL,
+    grant_wrap_nonce BLOB NOT NULL,
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (video_id) REFERENCES cases (id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+    FOREIGN KEY (session_token_hash) REFERENCES sessions (token_hash) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS video_passkey_attempts (
+    video_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    failed_attempts INTEGER NOT NULL DEFAULT 0 CHECK (failed_attempts >= 0),
+    locked_until TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (video_id, user_id),
+    FOREIGN KEY (video_id) REFERENCES cases (id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
 CREATE INDEX IF NOT EXISTS idx_cases_owner_id ON cases (owner_id);
 CREATE INDEX IF NOT EXISTS idx_jobs_case_id ON jobs (case_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions (user_id);
+CREATE INDEX IF NOT EXISTS idx_video_unlock_grants_expiry ON video_unlock_grants (expires_at);
 """
 
 
@@ -92,6 +128,16 @@ def initialize_database(database_path: Path) -> None:
             "duration_seconds": "REAL",
             "video_width": "INTEGER",
             "video_height": "INTEGER",
+            "passkey_salt": "BLOB",
+            "wrapped_video_key": "BLOB",
+            "key_wrap_nonce": "BLOB",
+            "crypto_version": "INTEGER",
+            "crypto_algorithm": "TEXT",
+            "key_wrap_algorithm": "TEXT",
+            "kdf_time_cost": "INTEGER",
+            "kdf_memory_cost_kib": "INTEGER",
+            "kdf_parallelism": "INTEGER",
+            "encrypted_size": "INTEGER",
         }
         for column, column_type in case_migrations.items():
             if column not in case_columns:

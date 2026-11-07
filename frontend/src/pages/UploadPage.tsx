@@ -38,6 +38,8 @@ function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
 export default function UploadPage({ authenticated }: { authenticated: boolean }) {
   const [title, setTitle] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  const [passkey, setPasskey] = useState("");
+  const [confirmPasskey, setConfirmPasskey] = useState("");
   const [validationError, setValidationError] = useState("");
   const [uploadError, setUploadError] = useState("");
   const [pollError, setPollError] = useState("");
@@ -113,6 +115,14 @@ export default function UploadPage({ authenticated }: { authenticated: boolean }
       setValidationError("Choose a video file to upload.");
       return;
     }
+    if (passkey.length < 16 || passkey.length > 1024) {
+      setValidationError("Use a video passkey between 16 and 1024 characters.");
+      return;
+    }
+    if (passkey !== confirmPasskey) {
+      setValidationError("The passkey entries do not match.");
+      return;
+    }
     if (!ACCEPTED_EXTENSIONS.has(extensionOf(file.name))) {
       setValidationError("Choose an MP4, M4V, MOV, AVI, MKV, or WEBM video.");
       return;
@@ -132,6 +142,8 @@ export default function UploadPage({ authenticated }: { authenticated: boolean }
       const accepted = await uploadVideo(
         cleanedTitle,
         file,
+        passkey,
+        confirmPasskey,
         setUploadProgress,
         controller.signal,
       );
@@ -149,6 +161,7 @@ export default function UploadPage({ authenticated }: { authenticated: boolean }
         video_width: null,
         video_height: null,
         is_owner: true,
+        original_protected: true,
       });
       window.dispatchEvent(new Event("videos-updated"));
     } catch (error) {
@@ -158,6 +171,8 @@ export default function UploadPage({ authenticated }: { authenticated: boolean }
     } finally {
       setIsUploading(false);
       uploadController.current = null;
+      setPasskey("");
+      setConfirmPasskey("");
     }
   }
 
@@ -216,6 +231,35 @@ export default function UploadPage({ authenticated }: { authenticated: boolean }
           }}
           type="file"
         />
+        <label className="field-label" htmlFor="video-passkey">Video-specific passkey</label>
+        <input
+          id="video-passkey"
+          className="text-input"
+          autoComplete="new-password"
+          disabled={isUploading || Boolean(caseId)}
+          maxLength={1024}
+          minLength={16}
+          onChange={(event) => setPasskey(event.target.value)}
+          required
+          type="password"
+          value={passkey}
+        />
+        <label className="field-label" htmlFor="confirm-video-passkey">Confirm passkey</label>
+        <input
+          id="confirm-video-passkey"
+          className="text-input"
+          autoComplete="new-password"
+          disabled={isUploading || Boolean(caseId)}
+          maxLength={1024}
+          minLength={16}
+          onChange={(event) => setConfirmPasskey(event.target.value)}
+          required
+          type="password"
+          value={confirmPasskey}
+        />
+        <p className="form-note">
+          This passkey is unique to this video. Keep it safe: losing it permanently prevents access to the original.
+        </p>
         {file && (
           <p className="selected-file">
             {file.name} <span>· {formatFileSize(file.size)}</span>
@@ -237,12 +281,13 @@ export default function UploadPage({ authenticated }: { authenticated: boolean }
         )}
         <p className="form-note">
           Maximum 500 MB. Accepted formats depend on installed OpenCV codecs.
-          Only your account can access the original source video.
+          Any signed-in user with this video's passkey can access the original.
         </p>
       </form>
 
       {videoStatus && (
         <section className="processing-card" aria-live="polite">
+          <p className="microcopy">Video ID: {videoStatus.case_id}</p>
           <div className="processing-heading">
             <div>
               <p className="eyebrow">Processing status</p>

@@ -110,6 +110,11 @@ export type VideoUploadResponse = {
   message: string;
 };
 
+export type VideoUnlockResponse = {
+  message: string;
+  expires_in_seconds: number;
+};
+
 export type VideoStatusResponse = {
   case_id: string;
   title: string;
@@ -123,7 +128,8 @@ export type VideoStatusResponse = {
   video_width: number | null;
   video_height: number | null;
   is_owner: boolean;
-};
+  original_protected: boolean;
+}
 
 export type VideoListItem = {
   case_id: string;
@@ -227,10 +233,31 @@ export function getVideoStatus(
   );
 }
 
-export function retryVideoProcessing(caseId: string): Promise<VideoUploadResponse> {
+export function retryVideoProcessing(
+  caseId: string,
+  passkey: string,
+): Promise<VideoUploadResponse> {
   return requestJson<VideoUploadResponse>(
     `/videos/${encodeURIComponent(caseId)}/retry`,
-    { method: "POST" },
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passkey }),
+    },
+  );
+}
+
+export function unlockVideoOriginal(
+  caseId: string,
+  passkey: string,
+): Promise<VideoUnlockResponse> {
+  return requestJson<VideoUnlockResponse>(
+    `/videos/${encodeURIComponent(caseId)}/unlock`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ passkey }),
+    },
   );
 }
 
@@ -261,6 +288,8 @@ export function deleteVideo(caseId: string): Promise<void> {
 export function uploadVideo(
   title: string,
   file: File,
+  passkey: string,
+  confirmPasskey: string,
   onProgress?: (percentage: number) => void,
   signal?: AbortSignal,
 ): Promise<VideoUploadResponse> {
@@ -268,6 +297,8 @@ export function uploadVideo(
     const xhr = new XMLHttpRequest();
     const form = new FormData();
     form.append("title", title);
+    form.append("passkey", passkey);
+    form.append("confirm_passkey", confirmPasskey);
     form.append("video", file);
 
     const abort = () => xhr.abort();
